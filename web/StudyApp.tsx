@@ -5,6 +5,8 @@ import { useReadingClock, flushReading } from './useReadingClock';
 import ReadingJournal, { duration } from './ReadingJournal';
 // BackupControls removed — inline backup controls from home version
 import './vendor-hyalite.js';
+import { measurePageLines, type LineRect } from './lineFocus';
+import { createSegmenter, splitAssistTokens, placeTokens, tokenStyle, assistActive, assistSpacing, type AssistToken, type AssistOpts, type SpacingLevel } from './assistRead';
 
 const INK = 'hsl(40, 8%, 16%)';
 const INK2 = 'hsl(40, 5%, 48%)';
@@ -300,6 +302,92 @@ function toast(msg: string) {
     setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 2000);
 }
 
+// 阅读页共用开关：≡ 菜单阅读钟、辅助阅读抽屉同款
+const ReaderSwitch: React.FC<{ on: boolean; night: boolean }> = ({ on, night }) => (
+    <span style={{
+        width: 40, height: 24, borderRadius: 12, position: 'relative', flexShrink: 0,
+        background: on ? (night ? 'rgba(221,221,221,0.85)' : INK) : (night ? 'rgba(255,255,255,0.16)' : 'rgba(60,55,45,0.14)'),
+        transition: 'background 180ms cubic-bezier(0.23,1,0.32,1)',
+    }}>
+        <span style={{
+            position: 'absolute', top: 3, left: 3, width: 18, height: 18, borderRadius: '50%',
+            background: on && night ? '#333' : night ? '#ddd' : '#fff',
+            boxShadow: '0 1px 4px rgba(40,35,25,0.25)',
+            transform: on ? 'translateX(16px)' : 'translateX(0)',
+            transition: 'transform 180ms cubic-bezier(0.23,1,0.32,1)',
+        }} />
+    </span>
+);
+
+// 阅读页共用胶囊分段：白 thumb 回弹、选中侧加粗（阅读设置「翻页」、辅助阅读「间距」）
+function ReaderSegPill<T extends string | number | boolean>({ options, value, onChange, night }: { options: [string, T][]; value: T; onChange: (v: T) => void; night: boolean }) {
+    const n = options.length;
+    const idx = Math.max(0, options.findIndex(([, v]) => v === value));
+    const ink = night ? '#ddd' : INK, ink2 = night ? '#888' : INK2;
+    return (
+        <div style={{ position: 'relative', flex: 1, height: 34, borderRadius: 999, background: night ? 'rgba(255,255,255,0.08)' : 'rgba(60,55,45,0.08)', display: 'flex' }}>
+            <div style={{
+                position: 'absolute', top: 3, bottom: 3, width: `calc(${100 / n}% - ${6 / n}px)`,
+                left: `calc(${(100 / n) * idx}% + ${3 - (6 / n) * idx}px)`,
+                borderRadius: 999, background: night ? '#3a3a3a' : '#fff',
+                boxShadow: '0 1px 6px rgba(40,35,25,0.22)',
+                transition: 'left .42s cubic-bezier(0.34, 1.65, 0.5, 1)',
+            }} />
+            {options.map(([label, v]) => (
+                <button key={label} onClick={() => onChange(v)}
+                    style={{
+                        flex: 1, position: 'relative', zIndex: 1, background: 'none', border: 'none', cursor: 'pointer',
+                        fontSize: 13, color: value === v ? ink : ink2,
+                        fontWeight: value === v ? 700 : 400,
+                        transition: 'color .25s, font-weight .25s',
+                    }}>{label}</button>
+            ))}
+        </div>
+    );
+}
+
+// 阅读页底部玻璃抽屉：阅读设置、辅助阅读共用一份
+const readerScrimStyle = (night: boolean): React.CSSProperties => ({ position: 'absolute', inset: 0, zIndex: 25, background: night ? 'rgba(0,0,0,0.5)' : 'rgba(30,26,20,0.35)' });
+const readerSheetStyle = (night: boolean): React.CSSProperties => ({
+    position: 'absolute', left: 8, right: 8, bottom: 8, zIndex: 26, borderRadius: 24,
+    background: night ? 'rgba(38,38,38,0.65)' : 'linear-gradient(rgba(255,255,255,0.15), rgba(255,255,255,0) 40%), rgba(252,252,252,0.5)',
+    backdropFilter: 'blur(40px) saturate(1.8)', WebkitBackdropFilter: 'blur(40px) saturate(1.8)' as any,
+    boxShadow: night ? '0 -8px 40px rgba(0,0,0,0.5)' : '0 -8px 40px rgba(40,35,25,0.18), inset 0 1px 0 rgba(255,255,255,0.5)',
+    border: `1px solid ${night ? 'rgba(255,255,255,0.07)' : 'rgba(60,55,45,0.08)'}`,
+    padding: '16px 16px 18px',
+});
+const ReaderSheetHeader: React.FC<{ title: string; night: boolean; onClose: () => void; style?: React.CSSProperties }> = ({ title, night, onClose, style }) => (
+    <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14, ...style }}>
+        <span style={{ fontSize: 15, fontWeight: 700, color: night ? '#ddd' : INK }}>{title}</span>
+        <button onClick={onClose}
+            style={{ marginLeft: 'auto', width: 26, height: 26, borderRadius: '50%', background: night ? 'rgba(255,255,255,0.10)' : 'rgba(60,55,45,0.08)', border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', color: night ? '#999' : INK2, cursor: 'pointer' }}>
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg>
+        </button>
+    </div>
+);
+// 阅读尺框：和纸同色的实心块垫在字下面；细边和外阴影另起一层压在变浅遮罩上面，外阴影只画在框外，不盖字
+const focusGlassStyle = (night: boolean): React.CSSProperties => ({
+    borderRadius: 10, boxSizing: 'border-box', pointerEvents: 'none',
+    background: night ? '#1a1a1a' : '#fffcf3',
+    boxShadow: night
+        ? 'inset 0 1px 0 rgba(255,255,255,0.07), inset 0 -1px 0 rgba(0,0,0,0.25)'
+        : 'inset 0 1px 0 rgba(255,255,255,0.9), inset 0 -1px 0 rgba(60,50,30,0.04)',
+});
+const focusEdgeStyle = (night: boolean): React.CSSProperties => ({
+    borderRadius: 10, boxSizing: 'border-box', pointerEvents: 'none', background: 'transparent',
+    border: night ? '0.5px solid rgba(255,255,255,0.10)' : '0.5px solid rgba(60,50,30,0.08)',
+    boxShadow: night
+        ? '0 1px 2px rgba(0,0,0,0.45), 0 6px 18px rgba(0,0,0,0.40)'
+        : '0 1px 2px rgba(60,50,30,0.07), 0 6px 16px rgba(60,50,30,0.08)',
+});
+const focusVeil = (night: boolean) => night ? 'rgba(26,26,26,0.62)' : 'rgba(255,252,243,0.62)';
+
+const lsGet = (k: string) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k: string, v: string) => { try { localStorage.setItem(k, v); } catch {} };
+const ASSIST_DEMO = '对于一种被认为已经过时的音乐格式，录音带的销售目前似乎正在快速推进。';
+// 正文显示时会解码 HTML 实体，字数和原文对不上；这种段落辅助阅读跳过，免得切词偏移和批注偏移错位
+const HAS_ENTITY = /&(?:quot|apos|lt|gt|amp|#\d+|#x[0-9a-fA-F]+);/;
+
 const StudyApp: React.FC = () => {
     const c = themeColors(245, 25, 65);
 
@@ -425,6 +513,38 @@ const StudyApp: React.FC = () => {
         else setFabVisible(v => !v);
     };
 
+    // 辅助阅读（阅读尺）：当前行黑字+淡框，其余行盖半透明底色变浅；点按/键盘逐行走
+    const [lineFocus, setLineFocus] = useState(() => lsGet('coread-line-focus') === 'true');
+    const [focusLines, setFocusLines] = useState<LineRect[]>([]);
+    const [focusIdx, setFocusIdx] = useState(0);
+    const focusLandRef = useRef<'first' | 'last'>('first');
+    const focusPageKeyRef = useRef('');
+    // 辅助阅读抽屉：切词/加粗/放大/间距；没有 Intl.Segmenter 的老浏览器前三项静默不生效
+    const [assistPhase, setAssistPhase] = useState<'closed' | 'open' | 'closing'>('closed');
+    const [assistSplit, setAssistSplit] = useState(() => lsGet('coread-assist-split') === 'true');
+    const [assistBold, setAssistBold] = useState(() => lsGet('coread-assist-bold') === 'true');
+    const [assistEnlarge, setAssistEnlarge] = useState(() => lsGet('coread-assist-enlarge') === 'true');
+    const [assistSpacingLv, setAssistSpacingLv] = useState<SpacingLevel>(() => { const v = parseInt(lsGet('coread-assist-spacing') || '0', 10); return v === 1 || v === 2 ? v : 0; });
+    const segmenter = useMemo(() => createSegmenter(), []);
+    const assistOpts: AssistOpts = useMemo(() => segmenter
+        ? { split: assistSplit, bold: assistBold, enlarge: assistEnlarge }
+        : { split: false, bold: false, enlarge: false }, [segmenter, assistSplit, assistBold, assistEnlarge]);
+    const assistOn = assistActive(assistOpts);
+    const assistSig = `${assistOpts.split ? 's' : ''}${assistOpts.bold && !assistOpts.enlarge ? 'b' : ''}${assistOpts.enlarge ? 'e' : ''}${assistSpacingLv ? `g${assistSpacingLv}` : ''}`;
+    const tokenCacheRef = useRef<Map<string, AssistToken[]>>(new Map());
+    const tokensFor = (text: string): AssistToken[] => {
+        const cache = tokenCacheRef.current;
+        let t = cache.get(text);
+        if (!t) {
+            t = segmenter ? splitAssistTokens(text, segmenter) : [{ text, kind: 'content' }];
+            if (cache.size > 4000) cache.clear();
+            cache.set(text, t);
+        }
+        return t;
+    };
+    const assistFor = (fullText: string) => assistOn && !HAS_ENTITY.test(fullText);
+    const closeAssistSheet = () => { setAssistPhase('closing'); setTimeout(() => setAssistPhase(p => p === 'closing' ? 'closed' : p), 240); };
+
     // ⋯ menu phase machine
     useEffect(() => {
         let t: ReturnType<typeof setTimeout> | null = null;
@@ -540,6 +660,7 @@ const StudyApp: React.FC = () => {
             { open: lockPhase !== 'closed', close: closeLockDrawer, tag: 'lock' },
             { open: statsPhase !== 'closed', close: closeStatsDrawer, tag: 'stats' },
             { open: allNotesPhase !== 'closed', close: () => { setAllNotesPhase('closing'); setTimeout(() => setAllNotesPhase(p => p === 'closing' ? 'closed' : p), 240); }, tag: 'allNotes' },
+            { open: assistPhase !== 'closed', close: () => { if (assistPhase !== 'closing') closeAssistSheet(); }, tag: 'assist' },
             { open: sheetPhase !== 'closed', close: () => { setSheetPhase('closing'); setTimeout(() => setSheetPhase(p => p === 'closing' ? 'closed' : p), 240); }, tag: 'sheet' },
             { open: readerMenuPhase !== 'closed', close: closeReaderMenu, tag: 'menu' },
             { open: showReplies, close: () => setShowReplies(false), tag: 'replies' },
@@ -551,7 +672,7 @@ const StudyApp: React.FC = () => {
         const onPop = (e: PopStateEvent) => { topLayer.close(); };
         window.addEventListener('popstate', onPop);
         return () => { window.removeEventListener('popstate', onPop); };
-    }, [confirmBatchDelete, confirmDelete, lockPhase, menuDetail, menuPhase, panelDetail, panelPhase, restorePreview, showReplies, showSettings, statsPhase, allNotesPhase, sheetPhase, readerMenuPhase, uploading]);
+    }, [confirmBatchDelete, confirmDelete, lockPhase, menuDetail, menuPhase, panelDetail, panelPhase, restorePreview, showReplies, showSettings, statsPhase, allNotesPhase, assistPhase, sheetPhase, readerMenuPhase, uploading]);
 
     // Real-time comment sync — low-priority update, no flash
     useEffect(() => { commentsRef.current = comments; }, [comments]);
@@ -964,8 +1085,21 @@ const StudyApp: React.FC = () => {
 
     // 同书只存一份分页缓存，value里带测量时的尺寸，读取时容差校验。
     // 不能把精确像素拼进key：手机WebView每次打开视口差±几px，key永远miss，导致每次进书全书重新measure。
-    const paginationCacheKey = activeBook ? `pagebreaks-v3-${activeBook.id}-fs${readerFontSize}` : '';
+    const prevAssistSigRef = useRef<string | null>(null);
+    const paginationCacheKey = activeBook ? `pagebreaks-v3-${activeBook.id}-fs${readerFontSize}${assistSig ? `-a${assistSig}` : ''}` : '';
     const imgHeightCache = useRef<Map<string, number>>(new Map());
+
+    // 与 renderAssistText 同结构（词 span + 裸文本标点），分页量出来的才和显示一致
+    const appendAssistNodes = (el: HTMLElement, fullText: string, start: number, end: number, fs: number) => {
+        for (const t of placeTokens(tokensFor(fullText), start, end)) {
+            const st = tokenStyle(t.kind, t.text, assistOpts, fs * 0.3, t.gapAfter, readerNightMode);
+            if (!st) { el.appendChild(document.createTextNode(t.text)); continue; }
+            const span = document.createElement('span');
+            Object.assign(span.style, st);
+            span.textContent = t.text;
+            el.appendChild(span);
+        }
+    };
 
     const buildMeasureBlock = (para: Paragraph, sourceIdx: number, start: number, end: number) => {
         const heading = isHeading(para.content);
@@ -984,12 +1118,16 @@ const StudyApp: React.FC = () => {
             imgEl.style.width = '100%';
             outer.appendChild(imgEl);
         } else {
-            const displayText = stripHeading(para.content).slice(start, end);
+            const fullText = stripHeading(para.content);
+            const displayText = fullText.slice(start, end);
             const inner = document.createElement('div');
-            inner.textContent = displayText || ' ';
-            inner.style.fontSize = `${chapterTitle ? readerFontSize + 4 : para.content.trim().startsWith('# ') ? readerFontSize + 3 : para.content.trim().startsWith('## ') ? readerFontSize + 2 : readerFontSize}px`;
-            inner.style.lineHeight = String(chapterTitle ? 2.2 : 1.85);
-            inner.style.letterSpacing = `${chapterTitle ? 1 : 0.3}px`;
+            const fs = chapterTitle ? readerFontSize + 4 : para.content.trim().startsWith('# ') ? readerFontSize + 3 : para.content.trim().startsWith('## ') ? readerFontSize + 2 : readerFontSize;
+            if (displayText && assistFor(fullText)) appendAssistNodes(inner, fullText, start, end, fs);
+            else inner.textContent = displayText || ' ';
+            const sp = assistSpacing(chapterTitle ? 2.2 : 1.85, chapterTitle ? 1 : 0.3, fs, assistSpacingLv);
+            inner.style.fontSize = `${fs}px`;
+            inner.style.lineHeight = String(sp.lineHeight);
+            inner.style.letterSpacing = `${sp.letterSpacing}px`;
             inner.style.textIndent = heading || chapterTitle || start > 0 ? '0' : '1.5em';
             inner.style.fontWeight = String(chapterTitle ? 800 : heading ? 700 : 400);
             inner.style.textAlign = chapterTitle ? 'center' : '';
@@ -1161,28 +1299,54 @@ const StudyApp: React.FC = () => {
                 }
             };
 
-            const innerTextNode = (i: number): Text | null => {
+            // 段内文字可能拆在多个文本节点里（辅助阅读的词 span），按字符偏移映射回 (节点, 节点内偏移)
+            interface TextIndex { nodes: Text[]; starts: number[]; length: number }
+            const textIndexCache = new WeakMap<Element, TextIndex>();
+            const innerText = (i: number): TextIndex | null => {
                 const inner = blocks[blockIdx(i)]?.firstElementChild;
-                const node = inner?.firstChild;
-                return node && node.nodeType === Node.TEXT_NODE ? (node as Text) : null;
+                if (!inner) return null;
+                let ti = textIndexCache.get(inner);
+                if (!ti) {
+                    const nodes: Text[] = [], starts: number[] = [];
+                    let len = 0;
+                    const walker = document.createTreeWalker(inner, NodeFilter.SHOW_TEXT);
+                    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+                        const t = n as Text;
+                        if (!t.length) continue;
+                        nodes.push(t); starts.push(len); len += t.length;
+                    }
+                    ti = { nodes, starts, length: len };
+                    textIndexCache.set(inner, ti);
+                }
+                return ti.nodes.length ? ti : null;
+            };
+            // o 落在两节点交界时取前一节点的末尾，等价于单节点时 setEnd(node, o)
+            const locate = (ti: TextIndex, o: number): [Text, number] => {
+                let lo = 0, hi = ti.nodes.length - 1;
+                while (lo < hi) {
+                    const mid = (lo + hi + 1) >> 1;
+                    if (ti.starts[mid] < o) lo = mid; else hi = mid - 1;
+                }
+                return [ti.nodes[lo], Math.min(o - ti.starts[lo], ti.nodes[lo].length)];
             };
 
             // 前o个字符的包络底（逻辑纵坐标，单调递增），layout干净时读rect零reflow
-            const bottomAt = (textNode: Text, o: number) => {
-                measureRange.setStart(textNode, 0);
-                measureRange.setEnd(textNode, Math.min(o, textNode.length));
+            const bottomAt = (ti: TextIndex, o: number) => {
+                measureRange.setStart(ti.nodes[0], 0);
+                const [n, k] = locate(ti, Math.min(o, ti.length));
+                measureRange.setEnd(n, k);
                 return measureRange.getBoundingClientRect().bottom + rectShift;
             };
             // 排满到limitY的最大行尾offset；一行都放不下返回0
             const lineCut = (i: number, limitY: number): number => {
-                const textNode = innerTextNode(i);
-                if (!textNode || textNode.length === 0) return 0;
-                const len = textNode.length;
-                if (bottomAt(textNode, len) <= limitY) return len;
+                const ti = innerText(i);
+                if (!ti || ti.length === 0) return 0;
+                const len = ti.length;
+                if (bottomAt(ti, len) <= limitY) return len;
                 let lo = 1, hi = len, best = 0;
                 while (lo <= hi) {
                     const mid = (lo + hi) >> 1;
-                    if (bottomAt(textNode, mid) <= limitY) { best = mid; lo = mid + 1; }
+                    if (bottomAt(ti, mid) <= limitY) { best = mid; lo = mid + 1; }
                     else hi = mid - 1;
                 }
                 return best;
@@ -1192,11 +1356,10 @@ const StudyApp: React.FC = () => {
             const ensureChunk = async (i: number): Promise<boolean> => {
                 if (i >= allParas.length || i < chunkEnd) return true;
                 const anchorLogicalBottom = i > 0 ? rectBottom(i - 1) : 0;
-                if (progressive) {
-                    setPaginateProgress(Math.min(0.99, i / allParas.length));
-                    await new Promise<void>(r => setTimeout(r, 0));
-                    if (cancelled || !measureRef.current) return false;
-                }
+                // 小书也要块间让出主线程，不然切辅助阅读设置时整本书同步重排，抽屉动画卡住
+                if (progressive) setPaginateProgress(Math.min(0.99, i / allParas.length));
+                await new Promise<void>(r => setTimeout(r, 0));
+                if (cancelled || !measureRef.current) return false;
                 mountChunk(i, i > 0 ? i - 1 : null, anchorLogicalBottom);
                 chunkEnd = i + blocks.length - blockOffset;
                 return true;
@@ -1272,7 +1435,7 @@ const StudyApp: React.FC = () => {
                     }
                     const cut = lineCut(pi, limitY);
                     if (cut <= off) break; // 一行都进不来，整段推下页
-                    if (cut >= (innerTextNode(pi)?.length ?? 0)) { // 文本全放下了（块底差subpixel）
+                    if (cut >= (innerText(pi)?.length ?? 0)) { // 文本全放下了（块底差subpixel）
                         pi++; off = 0; pageHasContent = true; continue;
                     }
                     // widow control: 段从头开始且只塞得下<4字且页内已有内容 → 整段推下页
@@ -1288,9 +1451,10 @@ const StudyApp: React.FC = () => {
                 breaks.push({ paraIndex: pi, offset: off });
                 if (off > 0) {
                     // 段中切点：下一页顶=切点字符所在行的top
-                    const textNode = innerTextNode(pi)!;
-                    measureRange.setStart(textNode, Math.min(off, textNode.length));
-                    measureRange.setEnd(textNode, Math.min(off + 1, textNode.length));
+                    const ti = innerText(pi)!;
+                    const [sn, sk] = locate(ti, off + 1);
+                    measureRange.setStart(sn, Math.max(0, sk - 1));
+                    measureRange.setEnd(sn, sk);
                     cursorY = measureRange.getBoundingClientRect().top + rectShift;
                 } else {
                     cursorY = rectTop(pi) - chapterTopGap(pi);
@@ -1349,9 +1513,13 @@ const StudyApp: React.FC = () => {
             setReadingLoading(false);
             if (provisionalShown) toast('全书分页已完成');
         };
-        run();
-        return () => { cancelled = true; };
-    }, [mode, allParas, readerContentWidth, readerSize.height, readerFontSize, activeBook?.id, activeBook?.total_paragraphs]);
+        // 拨辅助阅读开关时等开关动画走完、连拨几下只重排最后一次
+        const assistChanged = prevAssistSigRef.current !== null && prevAssistSigRef.current !== assistSig;
+        prevAssistSigRef.current = assistSig;
+        const startTimer = assistChanged ? setTimeout(run, 300) : null;
+        if (!startTimer) run();
+        return () => { cancelled = true; if (startTimer) clearTimeout(startTimer); };
+    }, [mode, allParas, readerContentWidth, readerSize.height, readerFontSize, activeBook?.id, activeBook?.total_paragraphs, assistSig]);
 
     useEffect(() => {
         if (allParas.length === 0 || pageBreaks.length === 0) {
@@ -1403,6 +1571,66 @@ const StudyApp: React.FC = () => {
         }
     };
 
+    const stepLine = (delta: 1 | -1) => {
+        const next = focusIdx + delta;
+        if (next >= 0 && next < focusLines.length) { setFocusIdx(next); return; }
+        if (delta > 0 ? page >= totalPages : page <= 1) return;
+        focusLandRef.current = delta > 0 ? 'first' : 'last';
+        goPage(delta);
+    };
+    const stepLineRef = useRef(stepLine);
+    stepLineRef.current = stepLine;
+
+    const focusPageKey = pageFragments.length ? `${pageFragments[0].sourceIdx}:${pageFragments[0].startOffset}-${pageFragments[pageFragments.length - 1].sourceIdx}:${pageFragments[pageFragments.length - 1].endOffset}` : '';
+    useEffect(() => {
+        const host = contentRef.current;
+        if (!lineFocus || mode !== 'reading' || readingLoading || !host) { setFocusLines([]); return; }
+        let raf1 = 0, raf2 = 0, cancelled = false;
+        const measure = () => {
+            cancelAnimationFrame(raf1); cancelAnimationFrame(raf2);
+            raf1 = requestAnimationFrame(() => { raf2 = requestAnimationFrame(() => {
+                if (cancelled) return;
+                const root = host.querySelector('[data-page-content]') as HTMLElement | null;
+                const lines = root ? measurePageLines(root, host) : [];
+                const max = Math.max(0, lines.length - 1);
+                const turned = focusPageKeyRef.current !== focusPageKey;
+                const land = focusLandRef.current;
+                if (turned) { focusPageKeyRef.current = focusPageKey; focusLandRef.current = 'first'; }
+                setFocusLines(lines);
+                setFocusIdx(prev => turned ? (land === 'last' ? max : 0) : Math.min(prev, max));
+            }); });
+        };
+        measure();
+        const imgs = Array.from(host.querySelectorAll('[data-page-content] img')).filter(i => !(i as HTMLImageElement).complete);
+        imgs.forEach(i => i.addEventListener('load', measure));
+        document.fonts?.ready.then(() => { if (!cancelled) measure(); });
+        return () => { cancelled = true; cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); imgs.forEach(i => i.removeEventListener('load', measure)); };
+    }, [lineFocus, mode, readingLoading, focusPageKey, pageFragments, readerFontSize, readerNightMode, readerSize.width, readerSize.height, assistSig]);
+
+    useEffect(() => {
+        if (!lineFocus || mode !== 'reading') return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.altKey || e.ctrlKey || e.metaKey) return;
+            const t = e.target as HTMLElement | null;
+            if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.tagName === 'BUTTON' || t.isContentEditable)) return;
+            const d = e.key === ' ' || e.key === 'ArrowDown' || e.key === 'ArrowRight' ? 1 : e.key === 'ArrowUp' || e.key === 'ArrowLeft' ? -1 : 0;
+            if (!d) return;
+            e.preventDefault();
+            stepLineRef.current(d);
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [lineFocus, mode]);
+
+    const assistDemoRef = useRef<HTMLDivElement>(null);
+    const [assistDemoLines, setAssistDemoLines] = useState<LineRect[]>([]);
+    useLayoutEffect(() => {
+        const box = assistDemoRef.current;
+        if (assistPhase === 'closed' || !lineFocus || !box) { setAssistDemoLines([]); return; }
+        const text = box.querySelector('[data-demo-text]') as HTMLElement | null;
+        setAssistDemoLines(text ? measurePageLines(text, box) : []);
+    }, [assistPhase, lineFocus, assistSig, readerFontSize, readerNightMode]);
+
     const handleContentClick = (e: React.MouseEvent<HTMLDivElement>) => {
         if (mode !== 'reading') {
             if (activeComments.length) setActiveComments([]);
@@ -1425,6 +1653,16 @@ const StudyApp: React.FC = () => {
         // Keep annotation selection intact instead of accidentally turning a page.
         const selection = window.getSelection();
         if (selection && !selection.isCollapsed && selection.toString().trim()) return;
+
+        if (lineFocus) {
+            if (activeComments.length > 0) { setActiveComments([]); return; }
+            const r = e.currentTarget.getBoundingClientRect();
+            const x = r.width > 0 ? (e.clientX - r.left) / r.width : 0.5;
+            const y = r.height > 0 ? (e.clientY - r.top) / r.height : 0.5;
+            if (x > 0.3 && x < 0.7 && y > 0.35 && y < 0.65) toggleBar();
+            else stepLine(x >= 0.7 || (x > 0.3 && y >= 0.65) ? 1 : -1);
+            return;
+        }
 
         const rect = e.currentTarget.getBoundingClientRect();
         const tapPosition = rect.width > 0 ? (e.clientX - rect.left) / rect.width : 0.5;
@@ -1620,63 +1858,101 @@ const StudyApp: React.FC = () => {
         return !!(heading && heading[1].length <= 2);
     };
 
-    const renderHighlighted = (text: string, paraIdx: number, highlights: Comment[]) => {
+    // 高亮区间切成不重叠片段（先到先得），普通渲染和辅助阅读渲染共用
+    const highlightPieces = (text: string, highlights: Comment[]) => {
         const positioned = highlights
             .filter(h => h.sel_start_idx != null && h.sel_end_idx != null && h.sel_start_idx! < text.length)
             .sort((a, b) => a.sel_start_idx! - b.sel_start_idx!);
-        if (positioned.length === 0) return text;
-
-        const parts: React.ReactNode[] = [];
+        const pieces: { from: number; to: number; h: Comment }[] = [];
         let lastEnd = 0;
         for (const h of positioned) {
             const start = Math.max(h.sel_start_idx!, lastEnd);
             const end = Math.min(h.sel_end_idx!, text.length);
             if (start >= end) continue;
-            if (start > lastEnd) parts.push(<React.Fragment key={`t${paraIdx}-${lastEnd}`}>{text.slice(lastEnd, start)}</React.Fragment>);
-
-            const isShen = h.from_who.toLowerCase() === 'ai' || h.from_who.toLowerCase() === aiName.toLowerCase();
-            const hlBg = isShen ? c.shenHL : c.tongHL;
-            const dotColor = isShen ? c.shenColor : c.tongColor;
-
-            const showDot = h.paragraph_idx === paraIdx;
-            const hStart = start, hEnd = end;
-            parts.push(
-                <span key={`h${h.id}-${paraIdx}`}
-                    onClick={(e) => {
-                        if (window.getSelection()?.toString().trim()) return;
-                        e.stopPropagation();
-                        const overlapping = positioned.filter(x => {
-                            const xs = Math.max(x.sel_start_idx!, 0), xe = Math.min(x.sel_end_idx!, text.length);
-                            return xs < hEnd && xe > hStart;
-                        });
-                        const allReplies: Comment[] = [];
-                        const findReplies = (ids: number[]) => { const found = comments.filter(r => r.reply_to && ids.includes(r.reply_to)); if (found.length) { allReplies.push(...found); findReplies(found.map(f => f.id)); } };
-                        findReplies(overlapping.map(o => o.id));
-                        const withReplies = [...new Map([...overlapping, ...allReplies].map(x => [x.id, x])).values()];
-                        setActiveComments(prev => prev.length > 0 && prev[0]?.id === overlapping[0]?.id ? [] : withReplies);
-                    }}
-                    style={{
-                        backgroundImage: `linear-gradient(${hlBg}, ${hlBg})`,
-                        backgroundRepeat: 'no-repeat',
-                        backgroundSize: '100% 62%',
-                        backgroundPosition: '0 72%',
-                        borderRadius: 3,
-                        position: 'relative',
-                        cursor: 'pointer',
-                        textDecorationLine: 'none',
-                        padding: 0,
-                        lineHeight: 'inherit',
-                        boxDecorationBreak: 'clone',
-                        WebkitBoxDecorationBreak: 'clone',
-                    } as React.CSSProperties}>
-                    {showDot && <span style={{ position: 'absolute', top: -2, left: -2, width: 7, height: 7, borderRadius: '50%', background: dotColor, boxShadow: `0 0 3px ${dotColor}60`, pointerEvents: 'none' }} />}
-                    {text.slice(start, end)}
-                </span>
-            );
+            pieces.push({ from: start, to: end, h });
             lastEnd = end;
+        }
+        return { positioned, pieces };
+    };
+
+    const highlightSpan = (key: string, h: Comment, paraIdx: number, positioned: Comment[], textLen: number, hStart: number, hEnd: number, showDot: boolean, children: React.ReactNode) => {
+        const isShen = h.from_who.toLowerCase() === 'ai' || h.from_who.toLowerCase() === aiName.toLowerCase();
+        const hlBg = isShen ? c.shenHL : c.tongHL;
+        const dotColor = isShen ? c.shenColor : c.tongColor;
+        return (
+            <span key={key}
+                onClick={(e) => {
+                    if (window.getSelection()?.toString().trim()) return;
+                    e.stopPropagation();
+                    const overlapping = positioned.filter(x => {
+                        const xs = Math.max(x.sel_start_idx!, 0), xe = Math.min(x.sel_end_idx!, textLen);
+                        return xs < hEnd && xe > hStart;
+                    });
+                    const allReplies: Comment[] = [];
+                    const findReplies = (ids: number[]) => { const found = comments.filter(r => r.reply_to && ids.includes(r.reply_to)); if (found.length) { allReplies.push(...found); findReplies(found.map(f => f.id)); } };
+                    findReplies(overlapping.map(o => o.id));
+                    const withReplies = [...new Map([...overlapping, ...allReplies].map(x => [x.id, x])).values()];
+                    setActiveComments(prev => prev.length > 0 && prev[0]?.id === overlapping[0]?.id ? [] : withReplies);
+                }}
+                style={{
+                    backgroundImage: `linear-gradient(${hlBg}, ${hlBg})`,
+                    backgroundRepeat: 'no-repeat',
+                    backgroundSize: '100% 62%',
+                    backgroundPosition: '0 72%',
+                    borderRadius: 3,
+                    position: 'relative',
+                    cursor: 'pointer',
+                    textDecorationLine: 'none',
+                    padding: 0,
+                    lineHeight: 'inherit',
+                    boxDecorationBreak: 'clone',
+                    WebkitBoxDecorationBreak: 'clone',
+                } as React.CSSProperties}>
+                {showDot && <span style={{ position: 'absolute', top: -2, left: -2, width: 7, height: 7, borderRadius: '50%', background: dotColor, boxShadow: `0 0 3px ${dotColor}60`, pointerEvents: 'none' }} />}
+                {children}
+            </span>
+        );
+    };
+
+    const renderHighlighted = (text: string, paraIdx: number, highlights: Comment[]) => {
+        const { positioned, pieces } = highlightPieces(text, highlights);
+        if (pieces.length === 0) return text;
+        const parts: React.ReactNode[] = [];
+        let lastEnd = 0;
+        for (const { from, to, h } of pieces) {
+            if (from > lastEnd) parts.push(<React.Fragment key={`t${paraIdx}-${lastEnd}`}>{text.slice(lastEnd, from)}</React.Fragment>);
+            parts.push(highlightSpan(`h${h.id}-${paraIdx}`, h, paraIdx, positioned, text.length, from, to, h.paragraph_idx === paraIdx, text.slice(from, to)));
+            lastEnd = to;
         }
         if (lastEnd < text.length) parts.push(<React.Fragment key={`t${paraIdx}-${lastEnd}`}>{text.slice(lastEnd)}</React.Fragment>);
         return <>{parts}</>;
+    };
+
+    // 辅助阅读渲染：外层是词 span（结构与 appendAssistNodes 一致），高亮切进词里面，空隙只用 margin，不往文本里加字符
+    const renderAssistText = (fullText: string, fragStart: number, fragEnd: number, fs: number, paraIdx: number, highlights: Comment[]) => {
+        const text = fullText.slice(fragStart, fragEnd);
+        const { positioned, pieces } = highlightPieces(text, highlights);
+        const dotShown = new Set<number>();
+        const out: React.ReactNode[] = [];
+        for (const t of placeTokens(tokensFor(fullText), fragStart, fragEnd)) {
+            const ts = t.start - fragStart, te = ts + t.text.length;
+            const inner: React.ReactNode[] = [];
+            let cur = ts;
+            for (const p of pieces) {
+                if (p.to <= cur || p.from >= te) continue;
+                const a = Math.max(p.from, cur), b = Math.min(p.to, te);
+                if (a > cur) inner.push(text.slice(cur, a));
+                const first = !dotShown.has(p.h.id);
+                dotShown.add(p.h.id);
+                inner.push(highlightSpan(`h${p.h.id}-${paraIdx}-${a}`, p.h, paraIdx, positioned, text.length, p.from, p.to, first && p.h.paragraph_idx === paraIdx, text.slice(a, b)));
+                cur = b;
+            }
+            if (cur < te) inner.push(text.slice(cur, te));
+            const st = tokenStyle(t.kind, t.text, assistOpts, fs * 0.3, t.gapAfter, readerNightMode);
+            const children = inner.length === 1 && typeof inner[0] === 'string' ? inner[0] : inner;
+            out.push(st ? <span key={ts} style={st as React.CSSProperties}>{children}</span> : <React.Fragment key={ts}>{children}</React.Fragment>);
+        }
+        return out;
     };
 
     const glassBtn: React.CSSProperties = {
@@ -1911,7 +2187,7 @@ const StudyApp: React.FC = () => {
                         ) : allParas.length === 0 ? (
                             <div style={{ textAlign: 'center', padding: '40px 0', color: '#bbb', fontSize: 14 }}>这一页没有内容</div>
                         ) : (
-                            <div data-page-content style={{ padding: READER_PAGE_PADDING, minHeight: pageHeight || undefined, boxSizing: 'border-box', overflow: 'hidden' }}>
+                            <div data-page-content style={{ padding: READER_PAGE_PADDING, minHeight: pageHeight || undefined, boxSizing: 'border-box', overflow: 'hidden', position: 'relative', zIndex: 1 }}>
                                 {pageFragments.map((frag, visibleIndex) => {
                                     const original = allParas[frag.sourceIdx] || frag;
                                     const heading = isHeading(original.content) && !frag.isPartialStart;
@@ -1938,21 +2214,26 @@ const StudyApp: React.FC = () => {
                                             </div>
                                         );
                                     }
+                                    const paraFs = chapterTitle ? readerFontSize + 4 : original.content.trim().startsWith('# ') ? readerFontSize + 3 : original.content.trim().startsWith('## ') ? readerFontSize + 2 : readerFontSize;
+                                    const paraSp = assistSpacing(chapterTitle ? 2.2 : 1.85, chapterTitle ? 1 : 0.3, paraFs, assistSpacingLv);
+                                    const paraText = stripHeading(original.content);
                                     return (
                                         <div key={`${frag.idx}-${frag.startOffset}-${frag.endOffset}`} style={{ position: 'relative', marginBottom: chapterTitle ? CHAPTER_GAP_BOTTOM : PARA_GAP, marginTop: chapterTitle && visibleIndex > 0 ? CHAPTER_GAP_TOP : 0 }}>
                                             <div data-para-idx={frag.idx} data-frag-start={frag.startOffset} data-frag-end={frag.endOffset} style={{
-                                                fontSize: chapterTitle ? readerFontSize + 4 : original.content.trim().startsWith('# ') ? readerFontSize + 3 : original.content.trim().startsWith('## ') ? readerFontSize + 2 : readerFontSize,
-                                                lineHeight: chapterTitle ? 2.2 : 1.85, color: readerNightMode ? (heading ? '#ddd' : '#ccc') : (heading ? '#222' : '#333'),
-                                                letterSpacing: chapterTitle ? 1 : 0.3, textIndent: (heading || chapterTitle || frag.isPartialStart) ? 0 : '1.5em',
+                                                fontSize: paraFs,
+                                                lineHeight: paraSp.lineHeight, color: readerNightMode ? (heading ? '#ddd' : '#ccc') : (heading ? '#222' : '#333'),
+                                                letterSpacing: paraSp.letterSpacing, textIndent: (heading || chapterTitle || frag.isPartialStart) ? 0 : '1.5em',
                                                 fontWeight: chapterTitle ? 800 : heading ? 700 : 400, marginBottom: heading ? 4 : 0,
                                                 textAlign: chapterTitle ? 'center' : undefined,
                                                 userSelect: 'text', WebkitUserSelect: 'text', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word',
                                             } as any}>
-                                                {renderHighlighted(decodeEntities(frag.content), frag.idx, inlineComments)}
+                                                {frag.content && assistFor(paraText)
+                                                    ? renderAssistText(paraText, frag.startOffset, frag.endOffset, paraFs, frag.idx, inlineComments)
+                                                    : renderHighlighted(decodeEntities(frag.content), frag.idx, inlineComments)}
                                             </div>
 
                                             {blockComments.length > 0 && (
-                                                <div style={{ position: 'absolute', left: -16, top: (readerFontSize * 1.85 - 8) / 2, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                                <div style={{ position: 'absolute', left: -16, top: (readerFontSize * assistSpacing(1.85, 0.3, readerFontSize, assistSpacingLv).lineHeight - 8) / 2, display: 'flex', flexDirection: 'column', gap: 4 }}>
                                                     {blockComments.map(cmt => {
                                                         const isShen = cmt.from_who.toLowerCase() === 'ai' || cmt.from_who.toLowerCase() === aiName.toLowerCase();
                                                         const color = isShen ? c.shenColor : c.tongColor;
@@ -1983,6 +2264,32 @@ const StudyApp: React.FC = () => {
                         whiteSpace: 'normal',
                     }} />
                 )}
+                {mode === 'reading' && lineFocus && !readingLoading && focusLines.length > 0 && (() => {
+                    const ln = focusLines[Math.min(focusIdx, focusLines.length - 1)];
+                    const colL = Math.min(...focusLines.map(l => l.left)), colR = Math.max(...focusLines.map(l => l.right));
+                    const padY = Math.max(5, Math.round(readerFontSize * 0.4));
+                    const top = ln.top - padY, bottom = ln.bottom + padY;
+                    const veil = focusVeil(readerNightMode);
+                    const ease = '180ms cubic-bezier(0.23,1,0.32,1)';
+                    return (
+                        <>
+                            <div aria-hidden style={{
+                                ...focusGlassStyle(readerNightMode), position: 'absolute', zIndex: 0,
+                                left: colL - 10, width: colR - colL + 20, top, height: bottom - top,
+                                transition: `top ${ease}, height ${ease}`,
+                            }} />
+                            <div aria-hidden style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 2 }}>
+                                <div style={{ position: 'absolute', left: 0, right: 0, top: 0, height: Math.max(0, top), background: veil, transition: `height ${ease}` }} />
+                                <div style={{ position: 'absolute', left: 0, right: 0, top: bottom, bottom: 0, background: veil, transition: `top ${ease}` }} />
+                            </div>
+                            <div aria-hidden style={{
+                                ...focusEdgeStyle(readerNightMode), position: 'absolute', zIndex: 3,
+                                left: colL - 10, width: colR - colL + 20, top, height: bottom - top,
+                                transition: `top ${ease}, height ${ease}`,
+                            }} />
+                        </>
+                    );
+                })()}
             </div>
 
             {/* Floating annotation bar — appears when text is selected */}
@@ -2182,7 +2489,7 @@ const StudyApp: React.FC = () => {
                         <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M3 5h12M3 9h12M3 13h8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
                     </button>
 
-                    {/* Floating menu: 目录 / 阅读设置 / 阅读钟 + 所有批注 / 导出 / 统计 */}
+                    {/* Floating menu: 目录 / 阅读设置 / 辅助阅读 / 阅读钟 + 所有批注 / 导出 / 统计 */}
                     {readerMenuPhase !== 'closed' && (
                         <>
                             <div style={{ position: 'absolute', inset: 0, zIndex: 19 }} onClick={(e) => { e.stopPropagation(); closeReaderMenu(); }} />
@@ -2213,21 +2520,13 @@ const StudyApp: React.FC = () => {
                                                 <span style={labelSt}>阅读设置</span>
                                                 <svg width="17" height="17" viewBox="0 0 17 17" fill="none" style={{ color: mIcon, flexShrink: 0 }}><path d="M3 12.5V4.8c0-.4.4-.8.8-.8H8v8.5H3.8c-.4 0-.8-.4-.8-.8zM14 12.5V4.8c0-.4-.4-.8-.8-.8H9v8.5h4.2c.4 0 .8-.4.8-.8z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round"/></svg>
                                             </div>
+                                            <div style={rowSt} onClick={() => { closeReaderMenu(); setAssistPhase('open'); }}>
+                                                <span style={labelSt}>辅助阅读</span>
+                                                <svg width="17" height="17" viewBox="0 0 17 17" fill="none" style={{ color: mIcon, flexShrink: 0 }}><rect x="2.5" y="6.6" width="12" height="3.8" rx="1.9" stroke="currentColor" strokeWidth="1.3"/><path d="M4 3.6h9M4 13.4h6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                                            </div>
                                             <div style={rowSt} onClick={() => { const v = !showSessionClock; setShowSessionClock(v); localStorage.setItem('coread-show-session-clock', String(v)); }}>
                                                 <span style={labelSt}>阅读钟</span>
-                                                <span style={{
-                                                    width: 40, height: 24, borderRadius: 12, position: 'relative', flexShrink: 0,
-                                                    background: showSessionClock ? (readerNightMode ? 'rgba(221,221,221,0.85)' : INK) : (readerNightMode ? 'rgba(255,255,255,0.16)' : 'rgba(60,55,45,0.14)'),
-                                                    transition: 'background 180ms cubic-bezier(0.23,1,0.32,1)',
-                                                }}>
-                                                    <span style={{
-                                                        position: 'absolute', top: 3, left: 3, width: 18, height: 18, borderRadius: '50%',
-                                                        background: showSessionClock && readerNightMode ? '#333' : readerNightMode ? '#ddd' : '#fff',
-                                                        boxShadow: '0 1px 4px rgba(40,35,25,0.25)',
-                                                        transform: showSessionClock ? 'translateX(16px)' : 'translateX(0)',
-                                                        transition: 'transform 180ms cubic-bezier(0.23,1,0.32,1)',
-                                                    }} />
-                                                </span>
+                                                <ReaderSwitch on={showSessionClock} night={readerNightMode} />
                                             </div>
                                             <div style={{ height: 0.5, background: readerNightMode ? 'rgba(255,255,255,0.12)' : 'hsla(40,10%,40%,0.16)', margin: '4px 12px' }} />
                                             <div style={{ display: 'flex', justifyContent: 'space-around', padding: '6px 8px' }}>
@@ -2253,30 +2552,17 @@ const StudyApp: React.FC = () => {
                         <>
                             <div className={sheetPhase === 'closing' ? 'cr-scrim-out' : 'cr-scrim-in'}
                                 onClick={(e) => { e.stopPropagation(); setSheetPhase('closing'); setTimeout(() => setSheetPhase(p => p === 'closing' ? 'closed' : p), 240); }}
-                                style={{ position: 'absolute', inset: 0, zIndex: 25, background: readerNightMode ? 'rgba(0,0,0,0.5)' : 'rgba(30,26,20,0.35)' }} />
+                                style={readerScrimStyle(readerNightMode)} />
                             <div onClick={(e) => e.stopPropagation()}
                                 className={'hy-shelf ' + (sheetPhase === 'closing' ? 'cr-sheet-out' : 'cr-sheet-in')}
-                                style={{
-                                    position: 'absolute', left: 8, right: 8, bottom: 8, zIndex: 26, borderRadius: 24,
-                                    background: readerNightMode ? 'rgba(38,38,38,0.65)' : 'linear-gradient(rgba(255,255,255,0.15), rgba(255,255,255,0) 40%), rgba(252,252,252,0.5)',
-                                    backdropFilter: 'blur(40px) saturate(1.8)', WebkitBackdropFilter: 'blur(40px) saturate(1.8)' as any,
-                                    boxShadow: readerNightMode ? '0 -8px 40px rgba(0,0,0,0.5)' : '0 -8px 40px rgba(40,35,25,0.18), inset 0 1px 0 rgba(255,255,255,0.5)',
-                                    border: `1px solid ${readerNightMode ? 'rgba(255,255,255,0.07)' : 'rgba(60,55,45,0.08)'}`,
-                                    padding: '16px 16px 18px',
-                                }}>
+                                style={readerSheetStyle(readerNightMode)}>
                                 {(() => {
                                     const sInk = readerNightMode ? '#ddd' : INK;
                                     const sInk2 = readerNightMode ? '#888' : INK2;
                                     const briPct = (readerBrightness - 30) / 70;
                                     return (
                                         <>
-                                            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>
-                                                <span style={{ fontSize: 15, fontWeight: 700, color: sInk }}>阅读设置</span>
-                                                <button onClick={() => { setSheetPhase('closing'); setTimeout(() => setSheetPhase(p => p === 'closing' ? 'closed' : p), 240); }}
-                                                    style={{ marginLeft: 'auto', width: 26, height: 26, borderRadius: '50%', background: readerNightMode ? 'rgba(255,255,255,0.10)' : 'rgba(60,55,45,0.08)', border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', color: readerNightMode ? '#999' : INK2, cursor: 'pointer' }}>
-                                                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg>
-                                                </button>
-                                            </div>
+                                            <ReaderSheetHeader title="阅读设置" night={readerNightMode} onClose={() => { setSheetPhase('closing'); setTimeout(() => setSheetPhase(p => p === 'closing' ? 'closed' : p), 240); }} />
                                             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14, padding: '0 4px' }}>
                                                 <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ color: sInk2, flexShrink: 0 }}><circle cx="7" cy="7" r="2.6" stroke="currentColor" strokeWidth="1.2"/><path d="M7 1.5v1.3M7 11.2v1.3M1.5 7h1.3M11.2 7h1.3M3.2 3.2l.9.9M9.9 9.9l.9.9M10.8 3.2l-.9.9M4.1 9.9l-.9.9" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
                                                 <div style={{ position: 'relative', flex: 1, height: 22, display: 'flex', alignItems: 'center' }}>
@@ -2315,26 +2601,78 @@ const StudyApp: React.FC = () => {
                                             </div>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginTop: 14 }}>
                                                 <span style={{ fontSize: 13, fontWeight: 600, color: sInk, flexShrink: 0 }}>翻页</span>
-                                                <div style={{ position: 'relative', flex: 1, height: 34, borderRadius: 999, background: readerNightMode ? 'rgba(255,255,255,0.08)' : 'rgba(60,55,45,0.08)', display: 'flex' }}>
-                                                    <div style={{
-                                                        position: 'absolute', top: 3, bottom: 3, width: 'calc(50% - 3px)',
-                                                        left: pageTurnMode === 'tap' ? '50%' : 3,
-                                                        borderRadius: 999, background: readerNightMode ? '#3a3a3a' : '#fff',
-                                                        boxShadow: '0 1px 6px rgba(40,35,25,0.22)',
-                                                        transition: 'left .42s cubic-bezier(0.34, 1.65, 0.5, 1)',
-                                                    }} />
-                                                    {([['滑动', 'swipe'], ['点按', 'tap']] as [string, string][]).map(([label, val]) => (
-                                                        <button key={label} onClick={() => { setPageTurnMode(val as any); localStorage.setItem('coread-page-turn-mode', val); }}
-                                                            style={{
-                                                                flex: 1, position: 'relative', zIndex: 1, background: 'none', border: 'none', cursor: 'pointer',
-                                                                fontSize: 13, color: pageTurnMode === val ? sInk : sInk2,
-                                                                fontWeight: pageTurnMode === val ? 700 : 400,
-                                                                transition: 'color .25s, font-weight .25s',
-                                                            }}>{label}</button>
-                                                    ))}
-                                                </div>
+                                                <ReaderSegPill night={readerNightMode} value={pageTurnMode} options={[['滑动', 'swipe'], ['点按', 'tap']]}
+                                                    onChange={(val) => { setPageTurnMode(val); localStorage.setItem('coread-page-turn-mode', val); }} />
                                             </div>
                                         </>
+                                    );
+                                })()}
+                            </div>
+                        </>
+                    )}
+
+                    {/* 辅助阅读抽屉：壳与阅读设置同款；示范文字走正文同一套渲染 */}
+                    {assistPhase !== 'closed' && (
+                        <>
+                            <div className={assistPhase === 'closing' ? 'cr-scrim-out' : 'cr-scrim-in'}
+                                onClick={(e) => { e.stopPropagation(); closeAssistSheet(); }}
+                                style={readerScrimStyle(readerNightMode)} />
+                            <div onClick={(e) => e.stopPropagation()}
+                                className={'hy-shelf ' + (assistPhase === 'closing' ? 'cr-sheet-out' : 'cr-sheet-in')}
+                                style={{ ...readerSheetStyle(readerNightMode), height: 'min(50vh, calc(100% - 16px))', display: 'flex', flexDirection: 'column', boxSizing: 'border-box' }}>
+                                <ReaderSheetHeader title="辅助阅读" night={readerNightMode} onClose={closeAssistSheet} style={{ flexShrink: 0 }} />
+                                {(() => {
+                                    const sInk = readerNightMode ? '#ddd' : INK;
+                                    const sInk2 = readerNightMode ? '#888' : INK2;
+                                    const rowSt: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 14, marginTop: 14, cursor: 'pointer' };
+                                    const labelSt: React.CSSProperties = { fontSize: 13, fontWeight: 600, color: sInk, flex: 1, minWidth: 0 };
+                                    const hintSt: React.CSSProperties = { fontSize: 11, fontWeight: 400, color: sInk2, marginLeft: 6 };
+                                    const demoFs = readerFontSize;
+                                    const demoSp = assistSpacing(1.85, 0.3, demoFs, assistSpacingLv);
+                                    const demoLn = assistDemoLines[0];
+                                    const demoCol = assistDemoLines.length ? { l: Math.min(...assistDemoLines.map(l => l.left)), r: Math.max(...assistDemoLines.map(l => l.right)) } : null;
+                                    const padY = Math.max(5, Math.round(demoFs * 0.4));
+                                    const toggle = (label: string, hint: string, on: boolean, set: (v: boolean) => void, key: string, needsSeg: boolean) => {
+                                        const off = needsSeg && !segmenter;
+                                        return (
+                                            <div key={label} role="switch" aria-checked={on && !off} style={{ ...rowSt, opacity: off ? 0.45 : 1, cursor: off ? 'default' : 'pointer' }}
+                                                onClick={() => { if (off) return; const v = !on; set(v); lsSet(key, String(v)); }}>
+                                                <span style={labelSt}>{label}<span style={hintSt}>{off ? '此浏览器不支持' : hint}</span></span>
+                                                <ReaderSwitch on={on && !off} night={readerNightMode} />
+                                            </div>
+                                        );
+                                    };
+                                    return (
+                                        <div className="no-scrollbar" style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', margin: '0 -4px', padding: '0 4px 2px', scrollbarWidth: 'none' }}>
+                                            <div ref={assistDemoRef} style={{
+                                                position: 'relative', borderRadius: 16, padding: '12px 16px', overflow: 'hidden',
+                                                background: readerNightMode ? '#1a1a1a' : '#fffcf3',
+                                                border: `1px solid ${readerNightMode ? 'rgba(255,255,255,0.12)' : 'rgba(60,55,45,0.12)'}`,
+                                            }}>
+                                                {demoLn && demoCol && (
+                                                    <div aria-hidden style={{ ...focusGlassStyle(readerNightMode), position: 'absolute', zIndex: 0, left: demoCol.l - 8, width: demoCol.r - demoCol.l + 16, top: demoLn.top - padY, height: demoLn.bottom - demoLn.top + padY * 2 }} />
+                                                )}
+                                                <div data-demo-text style={{
+                                                    position: 'relative', zIndex: 1, fontSize: demoFs, lineHeight: demoSp.lineHeight, letterSpacing: demoSp.letterSpacing,
+                                                    color: readerNightMode ? '#ccc' : '#333', textIndent: '1.5em', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word',
+                                                } as React.CSSProperties}>
+                                                    {assistOn ? renderAssistText(ASSIST_DEMO, 0, ASSIST_DEMO.length, demoFs, -1, []) : ASSIST_DEMO}
+                                                </div>
+                                                {demoLn && demoCol && (<>
+                                                    <div aria-hidden style={{ position: 'absolute', left: 0, right: 0, top: demoLn.bottom + padY, bottom: 0, zIndex: 2, background: focusVeil(readerNightMode), pointerEvents: 'none' }} />
+                                                    <div aria-hidden style={{ ...focusEdgeStyle(readerNightMode), position: 'absolute', zIndex: 3, left: demoCol.l - 8, width: demoCol.r - demoCol.l + 16, top: demoLn.top - padY, height: demoLn.bottom - demoLn.top + padY * 2 }} />
+                                                </>)}
+                                            </div>
+                                            {toggle('阅读尺', '逐行聚焦，点按走行', lineFocus, setLineFocus, 'coread-line-focus', false)}
+                                            {toggle('切词', '词与词之间留空', assistSplit, setAssistSplit, 'coread-assist-split', true)}
+                                            {toggle('加粗', '实词加粗', assistBold, setAssistBold, 'coread-assist-bold', true)}
+                                            {toggle('放大', '实词放大，虚词变浅', assistEnlarge, setAssistEnlarge, 'coread-assist-enlarge', true)}
+                                            <div style={{ ...rowSt, cursor: 'default' }}>
+                                                <span style={{ ...labelSt, flex: 'none' }}>间距</span>
+                                                <ReaderSegPill night={readerNightMode} value={assistSpacingLv} options={[['标准', 0], ['宽', 1], ['更宽', 2]]}
+                                                    onChange={(v) => { setAssistSpacingLv(v as SpacingLevel); lsSet('coread-assist-spacing', String(v)); }} />
+                                            </div>
+                                        </div>
                                     );
                                 })()}
                             </div>
