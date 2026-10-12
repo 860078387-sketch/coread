@@ -5,7 +5,7 @@ import { useReadingClock, flushReading } from './useReadingClock';
 import ReadingJournal, { duration } from './ReadingJournal';
 // BackupControls removed — inline backup controls from home version
 import './vendor-hyalite.js';
-import { measurePageLines, type LineRect } from './lineFocus';
+import { measurePageLines, focusRange, stepFocusIndex, type LineRect, type FocusUnit, type FocusBlock } from './lineFocus';
 import { createSegmenter, splitAssistTokens, placeTokens, tokenStyle, assistActive, assistSpacing, type AssistToken, type AssistOpts, type SpacingLevel } from './assistRead';
 
 const INK = 'hsl(40, 8%, 16%)';
@@ -517,6 +517,8 @@ const StudyApp: React.FC = () => {
     const [lineFocus, setLineFocus] = useState(() => lsGet('coread-line-focus') === 'true');
     const [focusLines, setFocusLines] = useState<LineRect[]>([]);
     const [focusIdx, setFocusIdx] = useState(0);
+    // 逐行 / 逐段：只改框住的范围和走一步的跨度，不影响排版，不进分页缓存键
+    const [focusUnit, setFocusUnit] = useState<FocusUnit>(() => lsGet('coread-line-focus-unit') === 'para' ? 'para' : 'line');
     const focusLandRef = useRef<'first' | 'last'>('first');
     const focusPageKeyRef = useRef('');
     // 辅助阅读抽屉：切词/加粗/放大/间距；没有 Intl.Segmenter 的老浏览器前三项静默不生效
@@ -1572,8 +1574,8 @@ const StudyApp: React.FC = () => {
     };
 
     const stepLine = (delta: 1 | -1) => {
-        const next = focusIdx + delta;
-        if (next >= 0 && next < focusLines.length) { setFocusIdx(next); return; }
+        const next = stepFocusIndex(focusLines, focusIdx, delta, focusUnit);
+        if (next !== null) { setFocusIdx(next); return; }
         if (delta > 0 ? page >= totalPages : page <= 1) return;
         focusLandRef.current = delta > 0 ? 'first' : 'last';
         goPage(delta);
@@ -1591,7 +1593,7 @@ const StudyApp: React.FC = () => {
             raf1 = requestAnimationFrame(() => { raf2 = requestAnimationFrame(() => {
                 if (cancelled) return;
                 const root = host.querySelector('[data-page-content]') as HTMLElement | null;
-                const lines = root ? measurePageLines(root, host) : [];
+                const lines = root ? measurePageLines(root, host, '[data-para-idx]') : [];
                 const max = Math.max(0, lines.length - 1);
                 const turned = focusPageKeyRef.current !== focusPageKey;
                 const land = focusLandRef.current;
@@ -1628,7 +1630,7 @@ const StudyApp: React.FC = () => {
         const box = assistDemoRef.current;
         if (assistPhase === 'closed' || !lineFocus || !box) { setAssistDemoLines([]); return; }
         const text = box.querySelector('[data-demo-text]') as HTMLElement | null;
-        setAssistDemoLines(text ? measurePageLines(text, box) : []);
+        setAssistDemoLines(text ? measurePageLines(text, box, '[data-demo-text]') : []);
     }, [assistPhase, lineFocus, assistSig, readerFontSize, readerNightMode]);
 
     const handleContentClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -2265,7 +2267,7 @@ const StudyApp: React.FC = () => {
                     }} />
                 )}
                 {mode === 'reading' && lineFocus && !readingLoading && focusLines.length > 0 && (() => {
-                    const ln = focusLines[Math.min(focusIdx, focusLines.length - 1)];
+                    const ln = focusRange(focusLines, focusIdx, focusUnit)!;
                     const colL = Math.min(...focusLines.map(l => l.left)), colR = Math.max(...focusLines.map(l => l.right));
                     const padY = Math.max(5, Math.round(readerFontSize * 0.4));
                     const top = ln.top - padY, bottom = ln.bottom + padY;
@@ -2629,7 +2631,7 @@ const StudyApp: React.FC = () => {
                                     const hintSt: React.CSSProperties = { fontSize: 11, fontWeight: 400, color: sInk2, marginLeft: 6 };
                                     const demoFs = readerFontSize;
                                     const demoSp = assistSpacing(1.85, 0.3, demoFs, assistSpacingLv);
-                                    const demoLn = assistDemoLines[0];
+                                    const demoLn = focusRange(assistDemoLines, 0, focusUnit);
                                     const demoCol = assistDemoLines.length ? { l: Math.min(...assistDemoLines.map(l => l.left)), r: Math.max(...assistDemoLines.map(l => l.right)) } : null;
                                     const padY = Math.max(5, Math.round(demoFs * 0.4));
                                     const toggle = (label: string, hint: string, on: boolean, set: (v: boolean) => void, key: string, needsSeg: boolean) => {
@@ -2663,7 +2665,18 @@ const StudyApp: React.FC = () => {
                                                     <div aria-hidden style={{ ...focusEdgeStyle(readerNightMode), position: 'absolute', zIndex: 3, left: demoCol.l - 8, width: demoCol.r - demoCol.l + 16, top: demoLn.top - padY, height: demoLn.bottom - demoLn.top + padY * 2 }} />
                                                 </>)}
                                             </div>
-                                            {toggle('阅读尺', '逐行聚焦，点按走行', lineFocus, setLineFocus, 'coread-line-focus', false)}
+                                            {toggle('阅读尺', focusUnit === 'para' ? '逐段聚焦，点按走段' : '逐行聚焦，点按走行', lineFocus, setLineFocus, 'coread-line-focus', false)}
+                                            {lineFocus && (
+                                                <div style={{ ...rowSt, cursor: 'default' }}>
+                                                    <span style={{ ...labelSt, flex: 'none' }}>聚焦</span>
+                                                    <ReaderSegPill night={readerNightMode} value={focusUnit} options={[['逐行', 'line'], ['逐段', 'para']]}
+                                                        onChange={(v) => {
+                                                            // 逐段切回逐行：落到当前这段的第一行，不停在段尾
+                                                            if (v === 'line' && focusUnit === 'para') { const r = focusRange(focusLines, focusIdx, 'para') as FocusBlock | null; if (r) setFocusIdx(r.first); }
+                                                            setFocusUnit(v as FocusUnit); lsSet('coread-line-focus-unit', String(v));
+                                                        }} />
+                                                </div>
+                                            )}
                                             {toggle('切词', '词与词之间留空', assistSplit, setAssistSplit, 'coread-assist-split', true)}
                                             {toggle('加粗', '实词加粗', assistBold, setAssistBold, 'coread-assist-bold', true)}
                                             {toggle('放大', '实词放大，虚词变浅', assistEnlarge, setAssistEnlarge, 'coread-assist-enlarge', true)}
