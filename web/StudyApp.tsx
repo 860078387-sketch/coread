@@ -173,7 +173,7 @@ function getSafeAreaBottom(): number {
     return h;
 }
 const READER_HORIZONTAL_PADDING = 56;
-// 双页摊开时每页一行最多这么多个汉字宽：宽屏一行铺满七八十字，眼睛回行容易跳错
+// 平板和电脑上每页一行最多这么多个汉字宽（单页双页都算）：宽屏一行铺满七八十字，眼睛回行容易跳错
 const READER_MAX_LINE_CHARS = 36;
 const SPREAD_GUTTER = 72;
 // 双页：外侧边距 = READER_HORIZONTAL_PADDING，两栏正文之间 = SPREAD_GUTTER，跟 readerColumns 的算法对上
@@ -2319,7 +2319,7 @@ const StudyApp: React.FC = () => {
                                     ))}
                                 </div>
                             ) : (
-                            <div data-page-content style={{ padding: READER_PAGE_PADDING, minHeight: pageHeight || undefined, boxSizing: 'border-box', overflow: 'hidden', position: 'relative', zIndex: 1 }}>
+                            <div data-page-content style={{ padding: READER_PAGE_PADDING, width: readerContentWidth + READER_HORIZONTAL_PADDING, maxWidth: '100%', margin: '0 auto', minHeight: pageHeight || undefined, boxSizing: 'border-box', overflow: 'hidden', position: 'relative', zIndex: 1 }}>
                                 {renderPageFragments(pageFragments)}
                             </div>
                             )
