@@ -279,6 +279,9 @@ const idbGetParas = (key: string): Promise<string | null> =>
             req.onerror = () => resolve(null);
         } catch { resolve(null); }
     }));
+const cacheComments = (bookId: number, list: Comment[]) => {
+    idbSetParas(`comments-v1-${bookId}`, JSON.stringify(list)).catch(() => {});
+};
 const idbSetParas = (key: string, value: string): Promise<boolean> =>
     idbOpen().then(db => new Promise<boolean>((resolve) => {
         if (!db) return resolve(false);
@@ -717,7 +720,8 @@ const StudyApp: React.FC = () => {
                                 });
                                 return Array.from(merged.values());
                             };
-                            setAllComments(mergeComments);
+                            const bookId = activeBook.id;
+                            setAllComments(prev => { const u = mergeComments(prev); cacheComments(bookId, u); return u; });
                             setComments(mergeComments);
                         });
                     }
@@ -1761,7 +1765,8 @@ const StudyApp: React.FC = () => {
             setCommentText(''); setSelectedText(''); setSelRange(null); setReplyingTo(null);
             setActiveComments([]); setCommentingIdx(null);
             setComments(prev => [...prev, newComment]);
-            setAllComments(prev => [...prev, newComment]);
+            const bookId = activeBook.id;
+            setAllComments(prev => { const u = [...prev, newComment]; cacheComments(bookId, u); return u; });
             setPage(pageToRestore);
             setTimeout(() => { suppressPageJumpRef.current = false; }, 500);
         } catch (e: any) { toast(`批注失败: ${e.message}`); }
@@ -1772,7 +1777,8 @@ const StudyApp: React.FC = () => {
         try {
             await api.deleteBookComment(cmt.id);
             setComments(prev => prev.filter(x => x.id !== cmt.id));
-            setAllComments(prev => prev.filter(x => x.id !== cmt.id));
+            const bookId = cmt.book_id;
+            setAllComments(prev => { const u = prev.filter(x => x.id !== cmt.id); cacheComments(bookId, u); return u; });
             setActiveComments(prev => prev.filter(x => x.id !== cmt.id));
         } catch (e: any) { toast(`删除失败: ${e.message}`); }
     };
