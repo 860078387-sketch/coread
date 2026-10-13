@@ -84,8 +84,9 @@ export const api = {
     if (!res.ok) throw new Error('Export failed');
     return res.blob();
   },
-  imageUrl: (bookId: number, filename: string) =>
-    `${BASE}/v1/book-images/${bookId}/${filename}`,
+  // thumb：书架封面要缩小图（服务端没装 Pillow 时照样回原图）
+  imageUrl: (bookId: number, filename: string, opts?: { thumb?: boolean }) =>
+    `${BASE}/v1/book-images/${bookId}/${filename}${opts?.thumb ? '?thumb=1' : ''}`,
   fetchRoomDoor: () => request('/v1/reading-room/door'),
   setRoomDoor: (locked: boolean) =>
     request('/v1/reading-room/door', { method: 'POST', body: JSON.stringify({ locked }) }),

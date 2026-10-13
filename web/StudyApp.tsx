@@ -6,6 +6,7 @@ import ReadingJournal, { duration } from './ReadingJournal';
 // BackupControls removed — inline backup controls from home version
 import './vendor-hyalite.js';
 import { measurePageLines, focusRange, stepFocusIndex, type LineRect, type FocusUnit, type FocusBlock } from './lineFocus';
+import { readerColumns, type PageLayout } from './readerSpread';
 import { createSegmenter, splitAssistTokens, placeTokens, tokenStyle, assistActive, assistSpacing, type AssistToken, type AssistOpts, type SpacingLevel } from './assistRead';
 
 const INK = 'hsl(40, 8%, 16%)';
@@ -172,6 +173,12 @@ function getSafeAreaBottom(): number {
     return h;
 }
 const READER_HORIZONTAL_PADDING = 56;
+// 双页摊开时每页一行最多这么多个汉字宽：宽屏一行铺满七八十字，眼睛回行容易跳错
+const READER_MAX_LINE_CHARS = 36;
+const SPREAD_GUTTER = 72;
+// 双页：外侧边距 = READER_HORIZONTAL_PADDING，两栏正文之间 = SPREAD_GUTTER，跟 readerColumns 的算法对上
+const SPREAD_LEFT_PADDING = `56px ${SPREAD_GUTTER / 2}px calc(24px + env(safe-area-inset-bottom)) ${READER_HORIZONTAL_PADDING}px`;
+const SPREAD_RIGHT_PADDING = `56px ${READER_HORIZONTAL_PADDING}px calc(24px + env(safe-area-inset-bottom)) ${SPREAD_GUTTER / 2}px`;
 function decodeEntities(s: string): string {
     return s.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
 }
@@ -405,6 +412,7 @@ const StudyApp: React.FC = () => {
     // 大书首开渐进分页进度（0~1），非 null 时 loading 显示百分比
     const [paginateProgress, setPaginateProgress] = useState<number | null>(null);
     const [pageFragments, setPageFragments] = useState<PageFragment[]>([]);
+    const [pageFragmentsRight, setPageFragmentsRight] = useState<PageFragment[]>([]);
     const [readingLoading, setReadingLoading] = useState(false);
     const contentRef = useRef<HTMLDivElement>(null);
     const measureRef = useRef<HTMLDivElement>(null);
@@ -415,7 +423,10 @@ const StudyApp: React.FC = () => {
     const savedParaIdxRef = useRef<number | null>(null);
     const savedParaOffsetRef = useRef(0);
     const currentParaIdxRef = useRef<number | null>(null);
-    const currentParaOffsetRef = useRef(0);
+    // 读到的位置（段号+段内字数）。只在翻页/跳转让它离开可见页时更新，转屏重排不改它，否则每转一次往前挪
+    const anchorPosRef = useRef<{ idx: number; off: number } | null>(null);
+    // 尺寸变了、新页表还没落地时，旧页表配新尺寸渲染出来的页不算翻过
+    const repaginatingRef = useRef(false);
     // 后手优化：临时页表覆盖的段落区间（非null=全书分页仍在后台补全，窗外跳转先拦住）
     const provisionalRangeRef = useRef<{ from: number; to: number } | null>(null);
 
@@ -495,6 +506,8 @@ const StudyApp: React.FC = () => {
     const [sheetPhase, setSheetPhase] = useState<'closed' | 'open' | 'closing'>('closed');
     const [allNotesPhase, setAllNotesPhase] = useState<'closed' | 'open' | 'closing'>('closed');
     const [pageTurnMode, setPageTurnMode] = useState<'swipe' | 'tap'>(() => (localStorage.getItem('coread-page-turn-mode') as any) || 'tap');
+    // 版式：自动（横屏够宽摊两页）｜单页｜双页
+    const [pageLayout, setPageLayout] = useState<PageLayout>(() => { const v = lsGet('coread-page-layout'); return v === 'single' || v === 'double' ? v : 'auto'; });
     const openReaderMenu = () => { setReaderMenuPhase('anim'); setTimeout(() => setReaderMenuPhase(p => p === 'anim' ? 'open' : p), 330); };
     const closeReaderMenu = () => { setReaderMenuPhase('closing'); setTimeout(() => setReaderMenuPhase(p => p === 'closing' ? 'closed' : p), 180); };
     const displayName = (from: string) => {
@@ -986,7 +999,7 @@ const StudyApp: React.FC = () => {
         setPage(1); setTotalPages(1); setPageBreaks([{ paraIndex: 0, offset: 0 }]); setPageFragments([]); setPaginateProgress(null);
         setParagraphs([]); setComments([]); setAllParas([]); setAllComments([]);
         currentParaIdxRef.current = null;
-        currentParaOffsetRef.current = 0;
+        anchorPosRef.current = null;
         savedParaOffsetRef.current = 0;
         provisionalRangeRef.current = null;
         try {
@@ -1083,7 +1096,8 @@ const StudyApp: React.FC = () => {
         };
     }, [mode]);
 
-    const readerContentWidth = Math.max(1, readerSize.width - READER_HORIZONTAL_PADDING);
+    // 自动：横屏且够宽（平板横拿、电脑）才摊两页，手机竖拿永远单页
+    const { spread, contentWidth: readerContentWidth } = readerColumns(pageLayout, readerSize.width, readerSize.height, readerFontSize, READER_HORIZONTAL_PADDING, SPREAD_GUTTER, READER_MAX_LINE_CHARS);
 
     // 同书只存一份分页缓存，value里带测量时的尺寸，读取时容差校验。
     // 不能把精确像素拼进key：手机WebView每次打开视口差±几px，key永远miss，导致每次进书全书重新measure。
@@ -1145,6 +1159,7 @@ const StudyApp: React.FC = () => {
     useEffect(() => {
         if (mode !== 'reading' || !measureRef.current || allParas.length === 0 || readerContentWidth <= 1 || readerSize.height <= 0) return;
         let cancelled = false;
+        repaginatingRef.current = true;
         const run = async () => {
             await (document.fonts as any)?.ready?.catch(() => {});
             await new Promise<void>(r => requestAnimationFrame(() => r()));
@@ -1202,12 +1217,17 @@ const StudyApp: React.FC = () => {
                 }).catch(() => {});
             };
 
-            const pageForAnchor = (resolvedBreaks: PageBreak[], anchorIdx: number, anchorOffset: number) => {
-                const pi = allParas.findIndex(p => p.idx >= anchorIdx);
+            // 锚点（段号+段内字数）→ allParas 下标；段号不在了就落到它后面第一段的段首
+            const resolveAnchor = (a: { idx: number; off: number }) => {
+                const pi = allParas.findIndex(p => p.idx >= a.idx);
+                return { pi, off: pi >= 0 && allParas[pi].idx === a.idx ? a.off : 0 };
+            };
+            // 锚点落在新页表的哪一页（0 起）
+            const pageOf = (bks: PageBreak[], a: { idx: number; off: number }) => {
+                const { pi, off } = resolveAnchor(a);
                 if (pi < 0) return 0;
-                for (let i = resolvedBreaks.length - 1; i >= 0; i--) {
-                    const b = resolvedBreaks[i];
-                    if (b.paraIndex < pi || (b.paraIndex === pi && b.offset <= anchorOffset)) return i;
+                for (let i = bks.length - 1; i >= 0; i--) {
+                    if (bks[i].paraIndex < pi || (bks[i].paraIndex === pi && bks[i].offset <= off)) return i;
                 }
                 return 0;
             };
@@ -1216,8 +1236,10 @@ const StudyApp: React.FC = () => {
             // 立即可读，全书分页随后照常从0跑完后替换
             const startLiveIdx = currentParaIdxRef.current;
             let provisionalLandIdx: number | null = null;
-            const anchorIdx0 = savedParaIdxRef.current ?? currentParaIdxRef.current ?? allParas[0]?.idx ?? 0;
-            const anchorPi0 = allParas.findIndex(p => p.idx >= anchorIdx0);
+            const anchorPos0 = savedParaIdxRef.current != null
+                ? { idx: savedParaIdxRef.current, off: savedParaOffsetRef.current }
+                : anchorPosRef.current ?? { idx: currentParaIdxRef.current ?? allParas[0]?.idx ?? 0, off: 0 };
+            const anchorPi0 = resolveAnchor(anchorPos0).pi;
             const useProvisional = progressive && !suppressPageJumpRef.current && anchorPi0 > PROVISIONAL_WIN;
 
             // Try cache first（IndexedDB 主存；localStorage 里的旧缓存读出后迁移进IDB）
@@ -1240,11 +1262,10 @@ const StudyApp: React.FC = () => {
                             setTotalPages(Math.max(1, cachedBreaks.length));
                             syncPagination(cachedBreaks);
                             if (!suppressPageJumpRef.current) {
-                                const anchorIdx = savedParaIdxRef.current ?? currentParaIdxRef.current ?? allParas[0]?.idx ?? 0;
-                                const anchorOffset = savedParaIdxRef.current != null ? savedParaOffsetRef.current : currentParaOffsetRef.current;
-                                const targetPage = pageForAnchor(cachedBreaks, anchorIdx, anchorOffset);
+                                const targetPage = pageOf(cachedBreaks, anchorPos0);
                                 setPage(Math.max(1, Math.min(cachedBreaks.length, targetPage + 1)));
                             }
+                            repaginatingRef.current = false;
                             savedParaIdxRef.current = null;
                             savedParaOffsetRef.current = 0;
                             setReadingLoading(false);
@@ -1404,9 +1425,9 @@ const StudyApp: React.FC = () => {
                     provisionalRangeRef.current = { from: wFrom, to: wTo };
                     setPageBreaks(wb);
                     setTotalPages(Math.max(1, wb.length));
-                    let tp = 0;
-                    for (let k = wb.length - 1; k >= 0; k--) { if (wb[k].paraIndex <= anchorPi0) { tp = k; break; } }
+                    const tp = pageOf(wb, anchorPos0);
                     setPage(tp + 1);
+                    repaginatingRef.current = false;
                     provisionalLandIdx = allParas[wb[tp].paraIndex]?.idx ?? null;
                     savedParaIdxRef.current = null; // 锚点已用掉，全书分页完成时按实时阅读位置重映射
                     savedParaOffsetRef.current = 0;
@@ -1467,16 +1488,17 @@ const StudyApp: React.FC = () => {
             if (cancelled) return;
             provisionalRangeRef.current = null;
             // 落页必须和新页表同批提交：下面写缓存有await，期间"旧页码+新页表"会先渲染一次，
-            // 把currentParaIdxRef刷成无关段落。重排期间没翻过页就用开始时钉住的anchorIdx0。
+            // 把currentParaIdxRef刷成无关段落。重排期间没翻过页就用开始时钉住的anchorPos0。
             if (!suppressPageJumpRef.current) {
                 const live = currentParaIdxRef.current;
                 const turned = live != null && live !== startLiveIdx && live !== provisionalLandIdx;
-                const anchorIdx = savedParaIdxRef.current ?? (turned ? live! : anchorIdx0);
-                const pi = allParas.findIndex(p => p.idx >= anchorIdx);
-                let targetPage = 0;
-                if (pi >= 0) { for (let i = breaks.length - 1; i >= 0; i--) if (breaks[i].paraIndex <= pi) { targetPage = i; break; } }
+                const anchor = savedParaIdxRef.current != null
+                    ? { idx: savedParaIdxRef.current, off: savedParaOffsetRef.current }
+                    : turned ? (anchorPosRef.current ?? { idx: live!, off: 0 }) : anchorPos0;
+                const targetPage = pageOf(breaks, anchor);
                 setPage(Math.max(1, Math.min(breaks.length, targetPage + 1)));
             }
+            repaginatingRef.current = false;
             setPageBreaks(breaks);
             setTotalPages(Math.max(1, breaks.length));
             syncPagination(breaks);
@@ -1526,47 +1548,70 @@ const StudyApp: React.FC = () => {
     useEffect(() => {
         if (allParas.length === 0 || pageBreaks.length === 0) {
             setPageFragments([]);
+            setPageFragmentsRight([]);
             setParagraphs([]);
             setComments([]);
             currentParaIdxRef.current = null;
-            currentParaOffsetRef.current = 0;
             return;
         }
         if (page > pageBreaks.length && !suppressPageJumpRef.current) {
             setPage(pageBreaks.length);
             return;
         }
-        const start = pageBreaks[page - 1] || { paraIndex: 0, offset: 0 };
-        const end = page < pageBreaks.length ? pageBreaks[page] : { paraIndex: allParas.length, offset: 0 };
-        const fragments: PageFragment[] = [];
-        for (let i = start.paraIndex; i < end.paraIndex || (i === end.paraIndex && end.offset > 0); i++) {
-            const para = allParas[i];
-            if (!para) continue;
-            const text = stripHeading(para.content);
-            const from = i === start.paraIndex ? start.offset : 0;
-            const to = i === end.paraIndex ? end.offset : text.length;
-            if (to <= from) continue;
-            fragments.push({ ...para, content: text.slice(from, to), sourceIdx: i, startOffset: from, endOffset: to, isPartialStart: from > 0, isPartialEnd: to < text.length });
-        }
+        // 双页时左页永远是奇数页，跳转落到偶数页就退一页，两页一起摊开
+        if (spread && page % 2 === 0) { setPage(page - 1); return; }
+        const buildFragments = (p: number): PageFragment[] => {
+            const start = pageBreaks[p - 1] || { paraIndex: 0, offset: 0 };
+            const end = p < pageBreaks.length ? pageBreaks[p] : { paraIndex: allParas.length, offset: 0 };
+            const out: PageFragment[] = [];
+            for (let i = start.paraIndex; i < end.paraIndex || (i === end.paraIndex && end.offset > 0); i++) {
+                const para = allParas[i];
+                if (!para) continue;
+                const text = stripHeading(para.content);
+                const from = i === start.paraIndex ? start.offset : 0;
+                const to = i === end.paraIndex ? end.offset : text.length;
+                if (to <= from) continue;
+                out.push({ ...para, content: text.slice(from, to), sourceIdx: i, startOffset: from, endOffset: to, isPartialStart: from > 0, isPartialEnd: to < text.length });
+            }
+            return out;
+        };
+        const fragments = buildFragments(page);
+        const right = spread && page < pageBreaks.length ? buildFragments(page + 1) : [];
         setPageFragments(fragments);
-        const visibleParas = fragments.map(f => allParas[f.sourceIdx]).filter(Boolean);
+        setPageFragmentsRight(right);
+        const visibleParas = [...fragments, ...right].map(f => allParas[f.sourceIdx]).filter((p, i, arr) => p && arr.indexOf(p) === i);
         setParagraphs(visibleParas);
         setComments(allComments);
-        currentParaIdxRef.current = visibleParas[0]?.idx ?? null;
-        currentParaOffsetRef.current = start.offset;
-        if (activeBook && visibleParas.length > 0) {
-            api.updateBookProgress(activeBook.id, visibleParas[0].idx, start.offset).catch(() => {});
+        const firstFrag = fragments[0] ?? right[0];
+        if (firstFrag) {
+            // 锚点还在可见页（双页=左右两页）里就不动它；离开了才换成可见页首
+            const lastShown = page + (spread ? 1 : 0);
+            const end = lastShown < pageBreaks.length ? pageBreaks[lastShown] : { paraIndex: allParas.length, offset: 0 };
+            const a = anchorPosRef.current;
+            const anchorPi = a ? allParas.findIndex(p => p.idx === a.idx) : -1;
+            const before = (pi: number, off: number, b: PageBreak) => pi < b.paraIndex || (pi === b.paraIndex && off < b.offset);
+            const inView = anchorPi >= 0 && !before(anchorPi, a!.off, { paraIndex: firstFrag.sourceIdx, offset: firstFrag.startOffset }) && before(anchorPi, a!.off, end);
+            if (!inView && !repaginatingRef.current) anchorPosRef.current = { idx: allParas[firstFrag.sourceIdx].idx, off: firstFrag.startOffset };
+            currentParaIdxRef.current = anchorPosRef.current?.idx ?? allParas[firstFrag.sourceIdx].idx;
+        } else {
+            currentParaIdxRef.current = null;
         }
-    }, [page, pageBreaks, allParas, allComments, activeBook?.id]);
+        // 进度存锚点：转屏后页首变了，读到的位置没变；新书分页落地前（savedParaIdxRef 还在）不存，免得把进度冲成第1页
+        if (activeBook && visibleParas.length > 0 && savedParaIdxRef.current === null) {
+            const pos = anchorPosRef.current ?? (firstFrag ? { idx: allParas[firstFrag.sourceIdx].idx, off: firstFrag.startOffset } : { idx: visibleParas[0].idx, off: 0 });
+            api.updateBookProgress(activeBook.id, pos.idx, pos.off).catch(() => {});
+        }
+    }, [page, pageBreaks, allParas, allComments, activeBook?.id, spread]);
 
     const autoFinishRef = useRef<number | null>(null);
     const goPage = (delta: number) => {
         if (!activeBook) return;
-        const next = Math.max(1, Math.min(totalPages, page + delta));
+        let next = Math.max(1, Math.min(totalPages, page + delta * (spread ? 2 : 1)));
+        if (spread && next % 2 === 0) next -= 1;
         if (next !== page) {
             setActiveComments([]); setCommentingIdx(null); setSelRange(null); setFloatingBar(null);
             setPage(next);
-            if (next === totalPages && totalPages > 1 && autoFinishRef.current !== activeBook.id) {
+            if (next + (spread ? 1 : 0) >= totalPages && totalPages > 1 && autoFinishRef.current !== activeBook.id) {
                 autoFinishRef.current = activeBook.id;
                 api.markBookFinished(activeBook.id, localDateString()).catch(() => {});
             }
@@ -1576,7 +1621,7 @@ const StudyApp: React.FC = () => {
     const stepLine = (delta: 1 | -1) => {
         const next = stepFocusIndex(focusLines, focusIdx, delta, focusUnit);
         if (next !== null) { setFocusIdx(next); return; }
-        if (delta > 0 ? page >= totalPages : page <= 1) return;
+        if (delta > 0 ? page + (spread ? 1 : 0) >= totalPages : page <= 1) return;
         focusLandRef.current = delta > 0 ? 'first' : 'last';
         goPage(delta);
     };
@@ -1592,8 +1637,12 @@ const StudyApp: React.FC = () => {
             cancelAnimationFrame(raf1); cancelAnimationFrame(raf2);
             raf1 = requestAnimationFrame(() => { raf2 = requestAnimationFrame(() => {
                 if (cancelled) return;
-                const root = host.querySelector('[data-page-content]') as HTMLElement | null;
-                const lines = root ? measurePageLines(root, host, '[data-para-idx]') : [];
+                // 双页时左右两页分开量再接上：左页的行在前，右页段落编号接着左页往后排
+                const lines: LineRect[] = [];
+                for (const root of Array.from(host.querySelectorAll('[data-page-content]')) as HTMLElement[]) {
+                    const base = lines.reduce((m, l) => Math.max(m, (l.block ?? -1) + 1), 0);
+                    for (const l of measurePageLines(root, host, '[data-para-idx]')) lines.push(l.block !== undefined ? { ...l, block: l.block + base } : l);
+                }
                 const max = Math.max(0, lines.length - 1);
                 const turned = focusPageKeyRef.current !== focusPageKey;
                 const land = focusLandRef.current;
@@ -1607,7 +1656,7 @@ const StudyApp: React.FC = () => {
         imgs.forEach(i => i.addEventListener('load', measure));
         document.fonts?.ready.then(() => { if (!cancelled) measure(); });
         return () => { cancelled = true; cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); imgs.forEach(i => i.removeEventListener('load', measure)); };
-    }, [lineFocus, mode, readingLoading, focusPageKey, pageFragments, readerFontSize, readerNightMode, readerSize.width, readerSize.height, assistSig]);
+    }, [lineFocus, mode, readingLoading, focusPageKey, pageFragments, pageFragmentsRight, readerFontSize, readerNightMode, readerSize.width, readerSize.height, assistSig]);
 
     useEffect(() => {
         if (!lineFocus || mode !== 'reading') return;
@@ -1998,6 +2047,66 @@ const StudyApp: React.FC = () => {
         </>
     );
 
+    const renderPageFragments = (frags: PageFragment[]) => frags.map((frag, visibleIndex) => {
+                                    const original = allParas[frag.sourceIdx] || frag;
+                                    const heading = isHeading(original.content) && !frag.isPartialStart;
+                                    const chapterTitle = isChapterStart(original.content) && !frag.isPartialStart;
+                                    const rawInline = commentsForPara(frag.idx).filter(x => x.sel_start_idx != null && x.sel_end_idx != null);
+                                    const inlineComments = rawInline.map(h => {
+                                        const endPara = h.sel_end_para_idx ?? h.paragraph_idx;
+                                        let s = h.sel_start_idx!, e = h.sel_end_idx!;
+                                        if (h.paragraph_idx === frag.idx && endPara === frag.idx) { /* single para */ }
+                                        else if (h.paragraph_idx === frag.idx) { e = frag.endOffset; }
+                                        else if (endPara === frag.idx) { s = frag.startOffset; }
+                                        else { s = frag.startOffset; e = frag.endOffset; }
+                                        return { ...h, sel_start_idx: s - frag.startOffset, sel_end_idx: e - frag.startOffset };
+                                    }).filter(h => h.sel_end_idx! > 0 && h.sel_start_idx! < frag.content.length);
+
+                                    const blockComments = commentsForPara(frag.idx).filter(x => (x.sel_start_idx == null || x.sel_end_idx == null) && x.paragraph_idx === frag.idx && !frag.isPartialStart && !x.reply_to);
+
+                                    const imgMatch = frag.content.match(/^\[IMG:([^\]]+)\]$/);
+                                    if (imgMatch && activeBook) {
+                                        const imgUrl = api.imageUrl(activeBook.id, imgMatch[1]);
+                                        return (
+                                            <div key={`${frag.idx}-${frag.startOffset}-${frag.endOffset}`} style={{ marginBottom: PARA_GAP, textAlign: 'center' }}>
+                                                <img src={imgUrl} alt="" style={{ maxWidth: '100%', maxHeight: `${Math.floor(readerSize.height * 0.6)}px`, objectFit: 'contain', display: 'block', margin: '0 auto', borderRadius: 8 }} />
+                                            </div>
+                                        );
+                                    }
+                                    const paraFs = chapterTitle ? readerFontSize + 4 : original.content.trim().startsWith('# ') ? readerFontSize + 3 : original.content.trim().startsWith('## ') ? readerFontSize + 2 : readerFontSize;
+                                    const paraSp = assistSpacing(chapterTitle ? 2.2 : 1.85, chapterTitle ? 1 : 0.3, paraFs, assistSpacingLv);
+                                    const paraText = stripHeading(original.content);
+                                    return (
+                                        <div key={`${frag.idx}-${frag.startOffset}-${frag.endOffset}`} style={{ position: 'relative', marginBottom: chapterTitle ? CHAPTER_GAP_BOTTOM : PARA_GAP, marginTop: chapterTitle && visibleIndex > 0 ? CHAPTER_GAP_TOP : 0 }}>
+                                            <div data-para-idx={frag.idx} data-frag-start={frag.startOffset} data-frag-end={frag.endOffset} style={{
+                                                fontSize: paraFs,
+                                                lineHeight: paraSp.lineHeight, color: readerNightMode ? (heading ? '#ddd' : '#ccc') : (heading ? '#222' : '#333'),
+                                                letterSpacing: paraSp.letterSpacing, textIndent: (heading || chapterTitle || frag.isPartialStart) ? 0 : '1.5em',
+                                                fontWeight: chapterTitle ? 800 : heading ? 700 : 400, marginBottom: heading ? 4 : 0,
+                                                textAlign: chapterTitle ? 'center' : undefined,
+                                                userSelect: 'text', WebkitUserSelect: 'text', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word',
+                                            } as any}>
+                                                {frag.content && assistFor(paraText)
+                                                    ? renderAssistText(paraText, frag.startOffset, frag.endOffset, paraFs, frag.idx, inlineComments)
+                                                    : renderHighlighted(decodeEntities(frag.content), frag.idx, inlineComments)}
+                                            </div>
+
+                                            {blockComments.length > 0 && (
+                                                <div style={{ position: 'absolute', left: -16, top: (readerFontSize * assistSpacing(1.85, 0.3, readerFontSize, assistSpacingLv).lineHeight - 8) / 2, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                                    {blockComments.map(cmt => {
+                                                        const isShen = cmt.from_who.toLowerCase() === 'ai' || cmt.from_who.toLowerCase() === aiName.toLowerCase();
+                                                        const color = isShen ? c.shenColor : c.tongColor;
+                                                        return (
+                                                            <span key={cmt.id} onClick={(e) => { e.stopPropagation(); const allR: Comment[] = []; const findR = (ids: number[]) => { const f = comments.filter(r => r.reply_to && ids.includes(r.reply_to)); if (f.length) { allR.push(...f); findR(f.map(x => x.id)); } }; findR([cmt.id]); setActiveComments(prev => prev.length > 0 && prev[0]?.id === cmt.id ? [] : [cmt, ...allR]); }}
+                                                                style={{ width: 8, height: 8, borderRadius: '50%', background: color, cursor: 'pointer', display: 'inline-block', opacity: 0.7 }} />
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+    });
+
     return (
         <div className="xiaowo-study coread-study" style={{ height: '100%', width: '100%', display: 'flex', flexDirection: 'column', background: mode === 'reading' ? (readerNightMode ? '#1a1a1a' : '#fffcf3') : 'linear-gradient(145deg, #fbf9f6, #f5f1ee)', position: 'relative', overflow: 'hidden', filter: mode === 'reading' && readerBrightness < 100 ? `brightness(${readerBrightness / 100})` : undefined }}>
             <style>{`${STUDY_THEME_CSS}\n${COREAD_POP_CSS}\n@keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.05); } }`}</style>
@@ -2142,7 +2251,7 @@ const StudyApp: React.FC = () => {
                                                         </div>
                                                     )}
                                                     {book.cover_image ? (
-                                                        <img src={api.imageUrl(book.id, book.cover_image)} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                                                        <img src={api.imageUrl(book.id, book.cover_image, { thumb: true })} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                                                     ) : (
                                                         <span style={{ fontSize: 22, fontWeight: 800, color: 'rgba(60,55,48,0.35)', padding: 8, textAlign: 'center', lineHeight: 1.3, wordBreak: 'break-all' }}>{book.title.slice(0, 4)}</span>
                                                     )}
@@ -2189,67 +2298,25 @@ const StudyApp: React.FC = () => {
                         ) : allParas.length === 0 ? (
                             <div style={{ textAlign: 'center', padding: '40px 0', color: '#bbb', fontSize: 14 }}>这一页没有内容</div>
                         ) : (
-                            <div data-page-content style={{ padding: READER_PAGE_PADDING, minHeight: pageHeight || undefined, boxSizing: 'border-box', overflow: 'hidden', position: 'relative', zIndex: 1 }}>
-                                {pageFragments.map((frag, visibleIndex) => {
-                                    const original = allParas[frag.sourceIdx] || frag;
-                                    const heading = isHeading(original.content) && !frag.isPartialStart;
-                                    const chapterTitle = isChapterStart(original.content) && !frag.isPartialStart;
-                                    const rawInline = commentsForPara(frag.idx).filter(x => x.sel_start_idx != null && x.sel_end_idx != null);
-                                    const inlineComments = rawInline.map(h => {
-                                        const endPara = h.sel_end_para_idx ?? h.paragraph_idx;
-                                        let s = h.sel_start_idx!, e = h.sel_end_idx!;
-                                        if (h.paragraph_idx === frag.idx && endPara === frag.idx) { /* single para */ }
-                                        else if (h.paragraph_idx === frag.idx) { e = frag.endOffset; }
-                                        else if (endPara === frag.idx) { s = frag.startOffset; }
-                                        else { s = frag.startOffset; e = frag.endOffset; }
-                                        return { ...h, sel_start_idx: s - frag.startOffset, sel_end_idx: e - frag.startOffset };
-                                    }).filter(h => h.sel_end_idx! > 0 && h.sel_start_idx! < frag.content.length);
-
-                                    const blockComments = commentsForPara(frag.idx).filter(x => (x.sel_start_idx == null || x.sel_end_idx == null) && x.paragraph_idx === frag.idx && !frag.isPartialStart && !x.reply_to);
-
-                                    const imgMatch = frag.content.match(/^\[IMG:([^\]]+)\]$/);
-                                    if (imgMatch && activeBook) {
-                                        const imgUrl = api.imageUrl(activeBook.id, imgMatch[1]);
-                                        return (
-                                            <div key={`${frag.idx}-${frag.startOffset}-${frag.endOffset}`} style={{ marginBottom: PARA_GAP, textAlign: 'center' }}>
-                                                <img src={imgUrl} alt="" style={{ maxWidth: '100%', maxHeight: `${Math.floor(readerSize.height * 0.6)}px`, objectFit: 'contain', display: 'block', margin: '0 auto', borderRadius: 8 }} />
-                                            </div>
-                                        );
-                                    }
-                                    const paraFs = chapterTitle ? readerFontSize + 4 : original.content.trim().startsWith('# ') ? readerFontSize + 3 : original.content.trim().startsWith('## ') ? readerFontSize + 2 : readerFontSize;
-                                    const paraSp = assistSpacing(chapterTitle ? 2.2 : 1.85, chapterTitle ? 1 : 0.3, paraFs, assistSpacingLv);
-                                    const paraText = stripHeading(original.content);
-                                    return (
-                                        <div key={`${frag.idx}-${frag.startOffset}-${frag.endOffset}`} style={{ position: 'relative', marginBottom: chapterTitle ? CHAPTER_GAP_BOTTOM : PARA_GAP, marginTop: chapterTitle && visibleIndex > 0 ? CHAPTER_GAP_TOP : 0 }}>
-                                            <div data-para-idx={frag.idx} data-frag-start={frag.startOffset} data-frag-end={frag.endOffset} style={{
-                                                fontSize: paraFs,
-                                                lineHeight: paraSp.lineHeight, color: readerNightMode ? (heading ? '#ddd' : '#ccc') : (heading ? '#222' : '#333'),
-                                                letterSpacing: paraSp.letterSpacing, textIndent: (heading || chapterTitle || frag.isPartialStart) ? 0 : '1.5em',
-                                                fontWeight: chapterTitle ? 800 : heading ? 700 : 400, marginBottom: heading ? 4 : 0,
-                                                textAlign: chapterTitle ? 'center' : undefined,
-                                                userSelect: 'text', WebkitUserSelect: 'text', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word',
-                                            } as any}>
-                                                {frag.content && assistFor(paraText)
-                                                    ? renderAssistText(paraText, frag.startOffset, frag.endOffset, paraFs, frag.idx, inlineComments)
-                                                    : renderHighlighted(decodeEntities(frag.content), frag.idx, inlineComments)}
-                                            </div>
-
-                                            {blockComments.length > 0 && (
-                                                <div style={{ position: 'absolute', left: -16, top: (readerFontSize * assistSpacing(1.85, 0.3, readerFontSize, assistSpacingLv).lineHeight - 8) / 2, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                                                    {blockComments.map(cmt => {
-                                                        const isShen = cmt.from_who.toLowerCase() === 'ai' || cmt.from_who.toLowerCase() === aiName.toLowerCase();
-                                                        const color = isShen ? c.shenColor : c.tongColor;
-                                                        return (
-                                                            <span key={cmt.id} onClick={(e) => { e.stopPropagation(); const allR: Comment[] = []; const findR = (ids: number[]) => { const f = comments.filter(r => r.reply_to && ids.includes(r.reply_to)); if (f.length) { allR.push(...f); findR(f.map(x => x.id)); } }; findR([cmt.id]); setActiveComments(prev => prev.length > 0 && prev[0]?.id === cmt.id ? [] : [cmt, ...allR]); }}
-                                                                style={{ width: 8, height: 8, borderRadius: '50%', background: color, cursor: 'pointer', display: 'inline-block', opacity: 0.7 }} />
-                                                        );
-                                                    })}
-                                                </div>
-                                            )}
+                            spread ? (
+                                <div style={{ display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
+                                    {/* 中缝细线：贴在双页容器正中，不占宽度、不改边距 */}
+                                    <div aria-hidden style={{ position: 'absolute', left: '50%', top: 56, bottom: 24, width: 1, background: readerNightMode ? 'rgba(255,255,255,0.06)' : 'rgba(60,55,45,0.08)', pointerEvents: 'none' }} />
+                                    {[pageFragments, pageFragmentsRight].map((frags, i) => (
+                                        <div key={i} data-page-content style={{
+                                            padding: i === 0 ? SPREAD_LEFT_PADDING : SPREAD_RIGHT_PADDING,
+                                            width: readerContentWidth + READER_HORIZONTAL_PADDING + SPREAD_GUTTER / 2,
+                                            flexShrink: 0, minHeight: pageHeight || undefined, boxSizing: 'border-box', overflow: 'hidden', position: 'relative',
+                                        }}>
+                                            {renderPageFragments(frags)}
                                         </div>
-                                    );
-                                })}
+                                    ))}
+                                </div>
+                            ) : (
+                            <div data-page-content style={{ padding: READER_PAGE_PADDING, minHeight: pageHeight || undefined, boxSizing: 'border-box', overflow: 'hidden', position: 'relative', zIndex: 1 }}>
+                                {renderPageFragments(pageFragments)}
                             </div>
+                            )
                         )}
                     </>
                 )}
@@ -2268,7 +2335,11 @@ const StudyApp: React.FC = () => {
                 )}
                 {mode === 'reading' && lineFocus && !readingLoading && focusLines.length > 0 && (() => {
                     const ln = focusRange(focusLines, focusIdx, focusUnit)!;
-                    const colL = Math.min(...focusLines.map(l => l.left)), colR = Math.max(...focusLines.map(l => l.right));
+                    // 双页时框只框当前这一页那一栏，另一页同一高度也盖上浅色
+                    const midX = spread ? (contentRef.current?.clientWidth ?? readerSize.width) / 2 : null;
+                    const onLeft = midX != null && (ln.left + ln.right) / 2 < midX;
+                    const colLines = midX == null ? focusLines : focusLines.filter(l => ((l.left + l.right) / 2 < midX) === onLeft);
+                    const colL = Math.min(...colLines.map(l => l.left)), colR = Math.max(...colLines.map(l => l.right));
                     const padY = Math.max(5, Math.round(readerFontSize * 0.4));
                     const top = ln.top - padY, bottom = ln.bottom + padY;
                     const veil = focusVeil(readerNightMode);
@@ -2283,6 +2354,7 @@ const StudyApp: React.FC = () => {
                             <div aria-hidden style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 2 }}>
                                 <div style={{ position: 'absolute', left: 0, right: 0, top: 0, height: Math.max(0, top), background: veil, transition: `height ${ease}` }} />
                                 <div style={{ position: 'absolute', left: 0, right: 0, top: bottom, bottom: 0, background: veil, transition: `top ${ease}` }} />
+                                {midX != null && <div style={{ position: 'absolute', ...(onLeft ? { left: midX, right: 0 } : { left: 0, width: midX }), top, height: bottom - top, background: veil, transition: `top ${ease}, height ${ease}` }} />}
                             </div>
                             <div aria-hidden style={{
                                 ...focusEdgeStyle(readerNightMode), position: 'absolute', zIndex: 3,
@@ -2472,7 +2544,7 @@ const StudyApp: React.FC = () => {
                         textAlign: 'center', fontSize: 11, color: '#bbb', zIndex: 5,
                         pointerEvents: 'none',
                     }}>
-                        {page} / {totalPages} 页
+                        {spread && page < totalPages ? `${page}-${page + 1}` : page} / {totalPages} 页
                     </div>
 
                     {/* ≡ floating button */}
@@ -2605,6 +2677,12 @@ const StudyApp: React.FC = () => {
                                                 <span style={{ fontSize: 13, fontWeight: 600, color: sInk, flexShrink: 0 }}>翻页</span>
                                                 <ReaderSegPill night={readerNightMode} value={pageTurnMode} options={[['滑动', 'swipe'], ['点按', 'tap']]}
                                                     onChange={(val) => { setPageTurnMode(val); localStorage.setItem('coread-page-turn-mode', val); }} />
+                                            </div>
+                                            {/* 版式：横屏够宽时摊成左右两页 */}
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginTop: 14 }}>
+                                                <span style={{ fontSize: 13, fontWeight: 600, color: sInk, flexShrink: 0 }}>版式</span>
+                                                <ReaderSegPill night={readerNightMode} value={pageLayout} options={[['自动', 'auto'], ['单页', 'single'], ['双页', 'double']]}
+                                                    onChange={(val) => { setPageLayout(val); lsSet('coread-page-layout', val); }} />
                                             </div>
                                         </>
                                     );
@@ -3170,7 +3248,7 @@ const StudyApp: React.FC = () => {
                             </div>
                             <div style={{ flex: 1, minWidth: 0 }}>
                                 <div style={{ fontSize: 15, fontWeight: 700, color: tInk, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{activeBook?.title || '目录'}</div>
-                                <div style={{ fontSize: 12, color: tInk2, marginTop: 2 }}>第 {page} 页 · 共 {totalPages} 页</div>
+                                <div style={{ fontSize: 12, color: tInk2, marginTop: 2 }}>第 {spread && page < totalPages ? `${page}-${page + 1}` : page} 页 · 共 {totalPages} 页</div>
                             </div>
                             <button onClick={closeToc} style={{ width: 28, height: 28, borderRadius: '50%', flexShrink: 0, background: readerNightMode ? 'rgba(255,255,255,0.10)' : 'rgba(60,55,45,0.08)', border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', color: tInk2, cursor: 'pointer' }}>
                                 <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg>

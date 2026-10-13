@@ -40,6 +40,8 @@ npm start       # 启动服务器
 
 浏览器打开 `http://localhost:3000`。
 
+可选：装了 Python 3 和 Pillow（`pip install pillow`），书架封面会自动用缩小图；没装照旧用原图。
+
 > ⚠️ 网页和接口本身没有登录。服务器默认监听所有网卡（`0.0.0.0`），装在公网机器上时，谁拿到地址谁就能读写你的书和批注。建议用 `COREAD_HOST=127.0.0.1` 只监听本机，再放到带认证的反向代理或 Tailscale 这类私网后面。
 >
 > 前端默认按根路径打包。要挂在子路径下（比如 `https://example.com/coread/`），用 `npx vite build --base=/coread/` 构建。
@@ -108,6 +110,7 @@ Streamable HTTP端点：`http://你的服务器:3001/mcp`
 | `COREAD_NOTIFY_FROM` | `human` | 触发通知的评论者名字，`*` 表示所有人 |
 | `ROOM_OWNER_KEY` | 空 | 关门锁的开门钥匙，见下方「关门锁」 |
 | `ROOM_LOCK_PATH` | `./data/reading-room-lock.json` | 关门锁状态文件 |
+| `COREAD_PYTHON` | `python3` | 生成书架封面缩小图用的 Python（要装 Pillow），用不了就发原图 |
 
 ## 关门锁（AI防沉迷）
 
@@ -181,13 +184,14 @@ lib/
   mcp-tools.mjs    — MCP工具定义与处理
   reading-stats.mjs / reading-events.mjs — 阅读记录与统计
   backup.mjs / backup-routes.mjs — 备份导出与恢复
+  cover-thumb.py   — 书架封面缩小图（可选，需 Pillow）
 test/              — 自带测试（npm test）
 web/
   StudyApp.tsx     — React前端（块测量分页阅读器 + 批注 + IndexedDB缓存）
   api.ts           — API客户端
   app.tsx          — 入口
 public/            — 构建产物（vite build生成，已提交方便直接部署）
-data/              — SQLite数据库 + 书籍图片（gitignore，不入库）
+data/              — SQLite数据库 + 书籍图片 + 封面缩小图（gitignore，不入库）
 ```
 
 ---
@@ -215,6 +219,8 @@ npm start
 The web UI and API have no login, and the server listens on `0.0.0.0` by default. On a public machine, set `COREAD_HOST=127.0.0.1` and put it behind an authenticating reverse proxy or a private network such as Tailscale. The frontend builds for the root path; for a sub-path deploy use `npx vite build --base=/coread/`.
 
 Open `http://localhost:3000` in your browser.
+
+Optional: with Python 3 and Pillow installed (`pip install pillow`), shelf covers are served as small thumbnails; without them the original images are used.
 
 ### MCP Setup
 
